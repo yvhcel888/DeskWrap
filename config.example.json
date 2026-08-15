@@ -1,0 +1,36 @@
+{
+  "appName": "My App",
+  "service": {
+    "command": [
+      "node",
+      "server.js"
+    ],
+    "cwd": ".",
+    "port": 3000,
+    "readyTimeout": 60000,
+    "env": {}
+  },
+  "window": {
+    "width": 1280,
+    "height": 800,
+    "minWidth": 800,
+    "minHeight": 600
+  },
+  "tray": false,
+  "autoRestart": false,
+  "showDevTools": false,
+  "proxy": {
+    "enabled": false,
+    "url": ""
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "glm",
+    "apiKey": "",
+    "model": "",
+    "baseUrl": ""
+  },
+  "platforms": [],
+  "locale": "auto",
+  "version": 1
+}

@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>DeskWrap - 把本地服务变成桌面应用</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #0f1115; color: #e6e8eb; height: 100vh;
+      display: flex; overflow: hidden;
+    }
+    /* ---------- Sidebar ---------- */
+    aside {
+      width: 190px; flex-shrink: 0; background: #12151b;
+      border-right: 1px solid #1e232b; display: flex; flex-direction: column;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 18px 16px; border-bottom: 1px solid #1e232b; }
+    .logo {
+      width: 34px; height: 34px; border-radius: 9px;
+      background: linear-gradient(135deg, #4f8cff, #7c5cff);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 17px; color: #fff;
+    }
+    .brand b { font-size: 15px; }
+    .brand small { display: block; color: #6b7684; font-size: 10px; font-weight: 400; }
+    nav { flex: 1; padding: 10px 8px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px; width: 100%;
+      padding: 10px 12px; margin-bottom: 4px; border: none; border-radius: 8px;
+      background: transparent; color: #9aa3af; font-size: 13.5px; cursor: pointer;
+      text-align: left; transition: background .12s, color .12s;
+    }
+    .nav-item:hover { background: #1a1f28; color: #dbe2ea; }
+    .nav-item.active { background: #1d2531; color: #6ea8ff; }
+    .nav-item .ico { width: 18px; text-align: center; }
+    .env-mini { padding: 12px 14px; border-top: 1px solid #1e232b; font-size: 11px; color: #6b7684; line-height: 1.9; }
+    .env-mini .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
+    .env-mini .ok { background: #6fd38c; }
+    .env-mini .bad { background: #f0616d; }
+    /* ---------- Main ---------- */
+    main { flex: 1; overflow-y: auto; padding: 26px 34px; max-width: 860px; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    h2 { font-size: 17px; margin-bottom: 4px; }
+    .sub { color: #8b95a1; font-size: 12.5px; margin-bottom: 20px; }
+    .row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
+    .field { margin-bottom: 14px; }
+    label { display: block; font-size: 12.5px; color: #9aa3af; margin-bottom: 6px; }
+    input[type="text"], input[type="password"], select, textarea {
+      width: 100%; padding: 9px 12px; border-radius: 8px;
+      background: #171b22; border: 1px solid #262c36; color: #e6e8eb; font-size: 13.5px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: #4f8cff; }
+    button {
+      padding: 9px 20px; border: none; border-radius: 8px; font-size: 13.5px;
+      cursor: pointer; transition: background .15s; white-space: nowrap;
+    }
+    .primary { background: #4f8cff; color: #fff; }
+    .primary:hover { background: #3d7aef; }
+    .ghost { background: #1c2027; color: #c9d1db; border: 1px solid #2a3038; }
+    .ghost:hover { background: #242a33; }
+    .danger { background: #3a2026; color: #f0a0a8; border: 1px solid #5c2a30; }
+    .dir {
+      flex: 1; padding: 9px 12px; border-radius: 8px; background: #171b22;
+      border: 1px solid #262c36; font-size: 12.5px; color: #8fd3ff;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .card {
+      background: #14181f; border: 1px solid #1e232b; border-radius: 12px;
+      padding: 18px 20px; margin-bottom: 14px;
+    }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9aa3af; }
+    .checkbox input { accent-color: #4f8cff; }
+    .status { margin-top: 12px; font-size: 13px; color: #f5b04a; min-height: 18px; white-space: pre-line; }
+    .status.ok { color: #6fd38c; }
+    /* env cards */
+    .env-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .env-card {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 13px 15px; background: #14181f; border: 1px solid #1e232b;
+      border-radius: 10px;
+    }
+    .env-card .name { font-size: 13.5px; font-weight: 600; }
+    .env-card .ver { font-size: 12.5px; color: #8fd3ff; }
+    .env-card .missing { color: #f0616d; }
+    .env-card .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .env-card .dot.ok { background: #6fd38c; }
+    .env-card .dot.bad { background: #f0616d; }
+    .env-card button { padding: 4px 10px; font-size: 11.5px; }
+    /* log panel */
+    #logView {
+      font-family: Consolas, monospace; font-size: 12px; color: #8fd3ff;
+      background: #10141a; border: 1px solid #262c36; border-radius: 8px;
+      padding: 10px; resize: vertical; line-height: 1.6;
+    }
+    #aiResult {
+      white-space: pre-wrap; max-height: 240px; overflow: auto;
+      background: #171b22; border: 1px solid #262c36; border-radius: 8px;
+      padding: 10px; line-height: 1.7; font-size: 12.5px; color: #c9d1db;
+    }
+    #agentFlow {
+      margin-top: 12px; font-size: 12.5px; color: #c9d1db; line-height: 1.8;
+      max-height: 320px; overflow: auto; white-space: pre-wrap; background: #10141a;
+      border: 1px solid #262c36; border-radius: 8px; padding: 10px;
+    }
+    .hint { font-size: 11.5px; color: #6b7684; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <aside>
+    <div class="brand">
+      <div class="logo">D</div>
+      <div><b>DeskWrap</b><small>本地服务 → 桌面应用</small></div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item active" data-panel="project"><span class="ico">🏠</span><span data-i18n="nav.project">项目</span></button>
+      <button class="nav-item" data-panel="env"><span class="ico">🔧</span><span data-i18n="nav.env">环境管理</span></button>
+      <button class="nav-item" data-panel="proxy"><span class="ico">🌐</span><span data-i18n="nav.proxy">代理</span></button>
+      <button class="nav-item" data-panel="ai"><span class="ico">🤖</span><span data-i18n="nav.ai">AI 设置</span></button>
+      <button class="nav-item" data-panel="deploy"><span class="ico">🚀</span><span data-i18n="nav.deploy">平台部署</span></button>
+      <button class="nav-item" data-panel="log"><span class="ico">📜</span><span data-i18n="nav.log">日志 &amp; 诊断</span></button>
+      <button class="nav-item" data-panel="settings"><span class="ico">⚙</span><span data-i18n="nav.settings">设置</span></button>
+    </nav>
+    <div class="env-mini" id="envMini">环境检测中…</div>
+  </aside>
+
+  <main>
+    <!-- ============ 项目 ============ -->
+    <section class="panel active" id="panel-project">
+      <h2 data-i18n="proj.title">项目</h2>
+      <p class="sub" data-i18n="proj.sub">输入项目地址（本地路径或 git 仓库），自动检测启动方式</p>
+      <div class="row">
+        <input type="text" id="addrInput" placeholder="本地路径 D:\projects\xxx 或 git 仓库 https://github.com/xxx/yyy" style="flex:1" />
+        <button class="ghost" id="resolveBtn">加载地址</button>
+        <button class="ghost" id="pickBtn">选择文件夹</button>
+      </div>
+      <div class="card" id="configCard" style="display:none">
+        <div class="row"><div class="dir" id="dirDisplay">未选择项目</div></div>
+        <div class="grid">
+          <div class="field"><label>应用名称 / App name</label><input type="text" id="appName" /></div>
+          <div class="field"><label>端口 / Port（0 = 跳过检测）</label><input type="text" id="port" value="0" /></div>
+        </div>
+        <div class="field"><label>启动命令 / Start command</label><input type="text" id="command" placeholder="npm run dev" /></div>
+        <div class="field"><label>工作目录 / Working directory</label><input type="text" id="cwd" /></div>
+        <div class="grid">
+          <div class="field">
+            <label>托盘模式</label>
+            <div class="checkbox"><input type="checkbox" id="tray" /> 关闭窗口后后台运行</div>
+          </div>
+          <div class="field">
+            <label>崩溃自动重启</label>
+            <div class="checkbox"><input type="checkbox" id="autoRestart" checked /> 服务异常自动重启</div>
+          </div>
+        </div>
+        <div class="field"><label>打包输出目录</label>
+          <div class="row" style="margin-bottom:0">
+            <input type="text" id="outDir" placeholder="默认：项目目录/release" style="flex:1" />
+            <button class="ghost" id="pickOutBtn">选择</button>
+          </div>
+        </div>
+        <div class="field"><label>项目克隆目录</label>
+          <div class="row" style="margin-bottom:0">
+            <input type="text" id="projectsDir" placeholder="默认：~/DeskWrapProjects" style="flex:1" />
+            <button class="ghost" id="pickProjectsBtn">选择</button>
+          </div>
+        </div>
+        <div id="detectInfo" style="font-size:12.5px;color:#8b95a1;line-height:1.8"></div>
+        <div class="row" style="margin-top:16px">
+          <button class="primary" id="runBtn">▶ 运行</button>
+          <button class="ghost" id="buildBtn">📦 打包</button>
+        </div>
+        <div class="status" id="status"></div>
+      </div>
+    </section>
+
+    <!-- ============ 环境管理 ============ -->
+    <section class="panel" id="panel-env">
+      <h2 data-i18n="nav.env">环境管理</h2>
+      <p class="sub">使用你自己安装的工具链。DeskWrap 不捆绑任何运行时，缺失时按下方指引安装</p>
+      <div class="env-grid" id="envGrid"></div>
+      <div class="card" style="margin-top:16px">
+        <label style="font-size:13px;color:#c9d1db;font-weight:600">当前项目要求</label>
+        <div id="enginesInfo" style="font-size:12.5px;color:#8b95a1;line-height:1.9;margin-top:8px">选择项目后显示 engines.node 版本要求检查结果。</div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <label style="font-size:13px;color:#c9d1db;font-weight:600">🎮 GPU 显存 &amp; 本地大模型适配（参考 ollama）</label>
+        <div id="vramInfo" style="font-size:12.5px;color:#8b95a1;line-height:1.9;margin-top:8px">检测中…</div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <label style="font-size:13px;color:#c9d1db;font-weight:600">📦 Node.js 版本管理</label>
+        <div id="nodeVersionsInfo" style="font-size:12.5px;color:#8b95a1;line-height:1.9;margin-top:8px">检测中…</div>
+      </div>
+    </section>
+
+    <!-- ============ 代理 ============ -->
+    <section class="panel" id="panel-proxy">
+      <h2 data-i18n="nav.proxy">代理</h2>
+      <p class="sub">可选。仅用于 DeskWrap 自身的网络操作（git 克隆、打包下载等），<b>不会</b>注入到你的服务进程</p>
+      <div class="card">
+        <div class="field">
+          <label>启用代理</label>
+          <div class="checkbox"><input type="checkbox" id="proxyEnabled" /> 克隆项目 / 下载依赖时使用代理</div>
+        </div>
+        <div class="field">
+          <label>代理地址</label>
+          <input type="text" id="proxyUrl" placeholder="http://127.0.0.1:7890" />
+          <div class="hint">支持 http / https / socks5，如 http://127.0.0.1:7890</div>
+        </div>
+        <div class="status" id="proxyStatus"></div>
+      </div>
+    </section>
+
+    <!-- ============ AI 设置 ============ -->
+    <section class="panel" id="panel-ai">
+      <h2 data-i18n="nav.ai">AI 设置</h2>
+      <p class="sub">服务出问题时，用 AI 分析日志并给出修复建议（API Key 仅保存在本地配置文件）</p>
+      <div class="card">
+        <div class="field">
+          <label>启用 AI 诊断</label>
+          <div class="checkbox"><input type="checkbox" id="aiEnabled" /> 在「日志 &amp; 诊断」中使用 AI</div>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label>服务提供商</label>
+            <select id="aiProvider"></select>
+          </div>
+          <div class="field">
+            <label>模型（留空用默认）</label>
+            <input type="text" id="aiModel" placeholder="如 glm-4-flash / deepseek-chat" />
+          </div>
+        </div>
+        <div class="field" id="aiBaseRow" style="display:none">
+          <label>API 地址 (base URL, OpenAI 兼容)</label>
+          <input type="text" id="aiBase" placeholder="http://127.0.0.1:11434/v1/chat/completions" />
+        </div>
+        <div class="field">
+          <label>API Key</label>
+          <input type="password" id="aiKey" placeholder="粘贴你的 API Key" />
+          <div class="hint">也可用环境变量 GLM_API_KEY / DEEPSEEK_API_KEY / QWEN_API_KEY</div>
+        </div>
+        <div class="row">
+          <button class="primary" id="aiSaveBtn">💾 保存到本地</button>
+          <button class="ghost" id="aiTestBtn">🔌 测试连接</button>
+        </div>
+        <div class="status" id="aiStatus"></div>
+      </div>
+    </section>
+
+    <!-- ============ 平台部署 ============ -->
+    <section class="panel" id="panel-deploy">
+      <h2 data-i18n="nav.deploy">平台部署</h2>
+      <p class="sub">搜索 GitHub / Gitee / HuggingFace / 魔搭 等开源平台，一键克隆部署到本地</p>
+      <div class="row">
+        <select id="platformSel" style="flex:0 0 180px"></select>
+        <input type="text" id="platformToken" placeholder="Token（该平台需要，保存到本地配置）" style="flex:0 0 280px; display:none" />
+        <input type="text" id="platformQuery" placeholder="搜索关键词，如：chatgpt / sd-webui / qwen" style="flex:1" />
+        <button class="primary" id="platformSearchBtn">🔍 搜索</button>
+      </div>
+      <div id="platformResults" style="margin-bottom:14px"></div>
+      <div class="card">
+        <label style="font-size:13px;color:#c9d1db;font-weight:600;margin-bottom:8px">➕ 添加自定义平台（提供搜索 API 即可）</label>
+        <div class="row" style="flex-wrap:wrap">
+          <input type="text" id="addPlatName" placeholder="平台名，如 Gitea" style="flex:0 0 140px" />
+          <input type="text" id="addPlatSearch" placeholder="搜索 API，如 https://git.example.com/api/v1/repos/search?q={q}" style="flex:1;min-width:260px" />
+          <input type="text" id="addPlatClone" placeholder="克隆前缀(可选)，如 https://git.example.com/{name}.git" style="flex:1;min-width:200px" />
+          <button class="ghost" id="addPlatBtn">添加</button>
+        </div>
+        <div class="status" id="deployStatus"></div>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="panel" id="panel-settings">
+      <h2 data-i18n="settings.title">设置</h2>
+      <p class="sub" data-i18n="settings.sub">应用偏好</p>
+      <div class="card">
+        <div class="field">
+          <label data-i18n="settings.lang">语言 / Language</label>
+          <select id="langSel">
+            <option value="auto">跟随系统 / Auto</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="en-US">English</option>
+          </select>
+          <div class="hint" data-i18n="settings.langHint">切换后立即生效，保存到本地配置</div>
+        </div>
+        <div class="status" id="settingsStatus"></div>
+      </div>
+    </section>
+
+    <!-- ============ 日志 & 诊断 ============ -->
+    <section class="panel" id="panel-log">
+      <h2 data-i18n="nav.log">日志 &amp; 诊断</h2>
+      <p class="sub">查看服务输出，用 AI 定位问题</p>
+      <div class="field">
+        <label>服务日志（最近 200 行）</label>
+        <textarea id="logView" rows="10"></textarea>
+      </div>
+      <div class="row">
+        <button class="ghost" id="refreshLogBtn">🔄 刷新日志</button>
+        <button class="primary" id="aiBtn">🤖 AI 诊断</button>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>AI 诊断结果</label>
+        <div id="aiResult">点击「AI 诊断」开始。需要先在 AI 设置中启用并填入 Key。</div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h2 style="font-size:14px;margin-bottom:10px">🤖 智能体（让 AI 自主修复直到成功）</h2>
+        <p class="hint" style="margin-bottom:12px">
+          智能体会分析环境与日志，自动执行命令（安装依赖）、修改配置、重试打包/运行，
+          直到目标达成（最多 15 步）。危险命令（格式化、删系统目录）会被拦截。
+        </p>
+        <div class="row">
+          <select id="agentGoal" style="flex:1">
+            <option value="让项目运行成功">🎯 让项目运行成功</option>
+            <option value="让打包成功">🎯 让打包成功</option>
+            <option value="让克隆/部署成功">🎯 让克隆/部署成功</option>
+          </select>
+          <button class="primary" id="agentStartBtn">▶ 开始智能体</button>
+          <button class="danger" id="agentStopBtn" style="display:none">■ 停止</button>
+        </div>
+        <div id="agentFlow"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+    var currentDir = null;
+
+    // ---------- i18n ----------
+    var I18N = {
+      'zh-CN': {
+        'nav.project': '项目', 'nav.env': '环境管理', 'nav.proxy': '代理',
+        'nav.ai': 'AI 设置', 'nav.deploy': '平台部署', 'nav.log': '日志 & 诊断',
+        'nav.settings': '设置',
+        'proj.title': '项目', 'proj.sub': '输入项目地址（本地路径或 git 仓库），自动检测启动方式',
+        'settings.title': '设置', 'settings.sub': '应用偏好',
+        'settings.lang': '语言 / Language', 'settings.langHint': '切换后立即生效，保存到本地配置',
+      },
+      'en-US': {
+        'nav.project': 'Project', 'nav.env': 'Environment', 'nav.proxy': 'Proxy',
+        'nav.ai': 'AI Settings', 'nav.deploy': 'Deploy', 'nav.log': 'Logs & AI',
+        'nav.settings': 'Settings',
+        'proj.title': 'Project', 'proj.sub': 'Enter a project address (local path or git repo), auto-detect how to run it',
+        'settings.title': 'Settings', 'settings.sub': 'App preferences',
+        'settings.lang': 'Language', 'settings.langHint': 'Takes effect immediately, saved to local config',
+      },
+    };
+
+    var currentLocale = 'zh-CN';
+    function applyI18n(lang) {
+      var dict = I18N[lang] || I18N['zh-CN'];
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        if (dict[el.dataset.i18n] !== undefined) el.textContent = dict[el.dataset.i18n];
+      });
+      document.documentElement.lang = lang;
+      currentLocale = lang;
+    }
+
+    async function initLocale() {
+      var locale = await window.deskwrap.getLocale();
+      applyI18n(locale);
+      var sel = document.getElementById('langSel');
+      sel.value = (locale === 'en-US' || locale === 'zh-CN') ? locale : 'auto';
+      sel.onchange = async function () {
+        var v = sel.value;
+        await window.deskwrap.setLocale(v);
+        var resolved = await window.deskwrap.getLocale();
+        applyI18n(resolved);
+        document.getElementById('settingsStatus').textContent =
+          resolved === 'zh-CN' ? '✔ 已切换为简体中文' : '✔ Switched to English';
+      };
+    }
+    initLocale();
+
+    // ---------- sidebar nav ----------
+    document.querySelectorAll('.nav-item').forEach(function (btn) {
+      btn.onclick = function () {
+        document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
+        btn.classList.add('active');
+        document.getElementById('panel-' + btn.dataset.panel).classList.add('active');
+      };
+    });
+
+    // ---------- environment ----------
+    var ENV_META = {
+      node: { name: 'Node.js', hint: 'https://nodejs.org/', install: 'https://nodejs.org/' },
+      npm: { name: 'npm', hint: '随 Node.js 安装', install: 'https://nodejs.org/' },
+      pnpm: { name: 'pnpm', hint: 'npm install -g pnpm', install: 'https://pnpm.io/' },
+      yarn: { name: 'yarn', hint: 'npm install -g yarn', install: 'https://yarnpkg.com/' },
+      git: { name: 'Git', hint: 'https://git-scm.com/', install: 'https://git-scm.com/' },
+      python: { name: 'Python', hint: 'https://www.python.org/', install: 'https://www.python.org/' },
+    };
+
+    async function refreshEnv() {
+      var env = await window.deskwrap.checkEnv();
+      var grid = document.getElementById('envGrid');
+      grid.innerHTML = '';
+      Object.keys(ENV_META).forEach(function (key) {
+        var meta = ENV_META[key];
+        var ver = env[key];
+        var card = document.createElement('div');
+        card.className = 'env-card';
+        card.innerHTML =
+          '<div style="display:flex;align-items:center;gap:10px">' +
+            '<span class="dot ' + (ver ? 'ok' : 'bad') + '"></span>' +
+            '<div><div class="name">' + meta.name + '</div>' +
+            '<div class="ver ' + (ver ? '' : 'missing') + '">' + (ver || '未安装') + '</div></div>' +
+          '</div>' +
+          (ver ? '' : '<button class="ghost">安装指引</button>');
+        if (!ver) {
+          card.querySelector('button').onclick = function () { window.deskwrap.openExternal(meta.install); };
+        }
+        grid.appendChild(card);
+      });
+      var mini = document.getElementById('envMini');
+      mini.innerHTML = Object.keys(ENV_META).map(function (k) {
+        return '<span><span class="dot ' + (env[k] ? 'ok' : 'bad') + '"></span>' + ENV_META[k].name + '</span>';
+      }).join(' ');
+    }
+    refreshEnv();
+
+    // ---------- project ----------
+    document.getElementById('pickBtn').onclick = async function () {
+      var dir = await window.deskwrap.pickFolder();
+      if (dir) loadProject(dir, false);
+    };
+
+    document.getElementById('resolveBtn').onclick = async function () {
+      var addr = document.getElementById('addrInput').value.trim();
+      if (!addr) return;
+      var statusEl = document.getElementById('status');
+      statusEl.textContent = '正在解析地址 / 克隆仓库…';
+      var res = await window.deskwrap.resolveProject(addr);
+      if (!res.ok) { statusEl.textContent = '加载失败: ' + res.error; return; }
+      loadProject(res.dir, res.cloned);
+      statusEl.textContent = res.cloned ? '✔ 仓库克隆完成' : '';
+    };
+    document.getElementById('addrInput').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') document.getElementById('resolveBtn').click();
+    });
+
+    async function loadProject(dir, cloned) {
+      currentDir = dir;
+      document.getElementById('dirDisplay').textContent = dir + (cloned ? '（已克隆）' : '');
+      document.getElementById('configCard').style.display = 'block';
+      document.getElementById('cwd').value = dir.replace(/\\/g, '/');
+      var projectsEl = document.getElementById('projectsDir');
+      if (!projectsEl.value) {
+        projectsEl.value = dir.replace(/[\\/][^\\/]*$/, '').replace(/\\/g, '/') + '/DeskWrapProjects';
+      }
+
+      var d = await window.deskwrap.detect(dir);
+      var info = document.getElementById('detectInfo');
+      if (d.error) { info.textContent = '检测失败: ' + d.error; return; }
+      var args = d.args || [];
+      info.innerHTML = '检测结果：类型 <b>' + d.type + '</b> · 建议命令 <b>' +
+        [d.command].concat(args).join(' ') + '</b> · 端口 <b>' + (d.port || '未知') + '</b>';
+      if (d.command) document.getElementById('command').value = [d.command].concat(args).join(' ');
+      if (d.port) document.getElementById('port').value = d.port;
+      document.getElementById('appName').value =
+        d.type === 'unknown' ? 'My App' : (dir.split(/[\\/]/).pop() || 'My App');
+
+      var env = await window.deskwrap.checkEnv();
+      var ei = document.getElementById('enginesInfo');
+      if (d.type === 'node' && env.node) {
+        var de = await window.deskwrap.detectEngines(dir);
+        ei.innerHTML = de.required
+          ? '项目要求 Node.js <b style="color:#8fd3ff">' + de.required + '</b>，当前 <b style="color:#8fd3ff">' +
+            String(env.node).replace(/^v/, '') + '</b> —— ' +
+            (de.ok ? '<span style="color:#6fd38c">✔ 满足</span>' : '<span style="color:#f0616d">✘ 版本过低，建议升级</span>')
+          : '项目未声明 engines.node 要求。';
+      } else {
+        ei.textContent = '选择 Node 项目后显示版本要求检查。';
+      }
+    }
+
+    document.getElementById('pickOutBtn').onclick = async function () {
+      var dir = await window.deskwrap.pickFolder();
+      if (dir) document.getElementById('outDir').value = dir.replace(/\\/g, '/');
+    };
+    document.getElementById('pickProjectsBtn').onclick = async function () {
+      var dir = await window.deskwrap.pickFolder();
+      if (dir) document.getElementById('projectsDir').value = dir.replace(/\\/g, '/');
+    };
+
+    function collectConfig() {
+      return {
+        appName: document.getElementById('appName').value || 'DeskWrap',
+        service: {
+          command: document.getElementById('command').value.trim().split(/\s+/),
+          cwd: document.getElementById('cwd').value.replace(/\\/g, '/'),
+          port: parseInt(document.getElementById('port').value, 10) || 0,
+          readyTimeout: 120000,
+          env: {},
+        },
+        window: { width: 1280, height: 840, minWidth: 900, minHeight: 600 },
+        tray: document.getElementById('tray').checked,
+        autoRestart: document.getElementById('autoRestart').checked,
+        showDevTools: false,
+        proxy: {
+          enabled: document.getElementById('proxyEnabled').checked,
+          url: document.getElementById('proxyUrl').value.trim(),
+        },
+        ai: {
+          enabled: document.getElementById('aiEnabled').checked,
+          provider: document.getElementById('aiProvider').value,
+          apiKey: document.getElementById('aiKey').value.trim(),
+          model: document.getElementById('aiModel').value.trim(),
+          baseUrl: document.getElementById('aiBase').value.trim(),
+        },
+        outDir: document.getElementById('outDir').value.trim(),
+        projectsDir: document.getElementById('projectsDir').value.trim(),
+      };
+    }
+
+    var statusEl = document.getElementById('status');
+    function setStatus(msg, ok) {
+      statusEl.textContent = msg;
+      statusEl.className = 'status' + (ok ? ' ok' : '');
+    }
+
+    document.getElementById('runBtn').onclick = async function () {
+      var cfg = collectConfig();
+      setStatus('正在启动服务并打开窗口…');
+      var res = await window.deskwrap.runApp(currentDir, cfg);
+      setStatus(res.ok ? '✔ 已启动，桌面窗口已打开。' : '启动失败: ' + res.error, res.ok);
+    };
+
+    document.getElementById('buildBtn').onclick = async function () {
+      var cfg = collectConfig();
+      setStatus('正在打包（几秒钟）…');
+      var res = await window.deskwrap.buildApp(currentDir, cfg);
+      if (res.ok) setStatus('✔ 打包完成: ' + (res.artifacts || []).join(', '), true);
+      else setStatus('打包失败: ' + res.error);
+    };
+
+    // ---------- proxy ----------
+    document.getElementById('proxyEnabled').onchange = function () {
+      document.getElementById('proxyStatus').textContent =
+        document.getElementById('proxyEnabled').checked
+          ? '✔ 代理将在克隆项目、打包下载时生效（不作用于你的服务）'
+          : '代理已关闭';
+    };
+
+    // ---------- AI settings ----------
+    var AI_PROVIDERS_GUI = [];
+    var aiModelList = [];
+    async function loadProviders() {
+      AI_PROVIDERS_GUI = await window.deskwrap.aiProviders();
+      var sel = document.getElementById('aiProvider');
+      sel.innerHTML = '';
+      AI_PROVIDERS_GUI.forEach(function (p) {
+        var opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+      });
+      sel.onchange = function () {
+        var p = AI_PROVIDERS_GUI.find(function (x) { return x.id === sel.value; });
+        document.getElementById('aiBaseRow').style.display = (p && p.id === 'custom') ? 'block' : 'none';
+        document.getElementById('aiModel').placeholder = '默认: ' + ((p && p.model) || '自定义');
+        refreshModelList();
+      };
+      sel.onchange();
+    }
+    loadProviders();
+
+    async function refreshModelList() {
+      var modelInput = document.getElementById('aiModel');
+      var oldDl = document.getElementById('aiModelList');
+      if (oldDl) oldDl.remove();
+      var prov = document.getElementById('aiProvider').value;
+      var p = AI_PROVIDERS_GUI.find(function (x) { return x.id === prov; });
+      if (!p || p.id === 'custom') return;
+      var res = await window.deskwrap.aiModels({
+        provider: prov,
+        baseUrl: document.getElementById('aiBase').value.trim(),
+        apiKey: document.getElementById('aiKey').value.trim(),
+      });
+      if (!res.ok || !res.models || res.models.length === 0) return;
+      aiModelList = res.models;
+      var dl = document.createElement('datalist');
+      dl.id = 'aiModelList';
+      res.models.slice(0, 300).forEach(function (m) {
+        var opt = document.createElement('option');
+        opt.value = m;
+        dl.appendChild(opt);
+      });
+      modelInput.after(dl);
+      modelInput.setAttribute('list', 'aiModelList');
+    }
+    document.getElementById('aiKey').addEventListener('change', refreshModelList);
+    document.getElementById('aiBase').addEventListener('change', refreshModelList);
+
+    // ---------- platform deploy ----------
+    async function loadPlatforms() {
+      var res = await window.deskwrap.platforms();
+      var sel = document.getElementById('platformSel');
+      sel.innerHTML = '';
+      res.platforms.forEach(function (p) {
+        var opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name + (p.needsToken ? ' 🔑' : '');
+        sel.appendChild(opt);
+      });
+      sel.onchange = function () {
+        var p = res.platforms.find(function (x) { return x.id === sel.value; });
+        document.getElementById('platformToken').style.display = (p && p.needsToken) ? '' : 'none';
+      };
+      sel.onchange();
+    }
+    loadPlatforms();
+
+    document.getElementById('platformSearchBtn').onclick = async function () {
+      var q = document.getElementById('platformQuery').value.trim();
+      if (!q) return;
+      var platformId = document.getElementById('platformSel').value;
+      var token = document.getElementById('platformToken').value.trim();
+      if (token) await window.deskwrap.platformSetToken(platformId, token);
+      var resultsEl = document.getElementById('platformResults');
+      resultsEl.innerHTML = '<div class="status">搜索中…</div>';
+      var res = await window.deskwrap.platformSearch(platformId, q);
+      if (!res.ok) { resultsEl.innerHTML = '<div class="status">搜索失败: ' + res.error + '</div>'; return; }
+      if (!res.items.length) { resultsEl.innerHTML = '<div class="status">没有结果</div>'; return; }
+      resultsEl.innerHTML = '';
+      res.items.forEach(function (it) {
+        var row = document.createElement('div');
+        row.className = 'env-card';
+        row.style.marginBottom = '8px';
+        var stars = (typeof it.stars === 'number') ? '★ ' + it.stars + ' ' : '';
+        row.innerHTML =
+          '<div style="min-width:0;flex:1">' +
+            '<div class="name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + it.name + '</div>' +
+            '<div class="hint">' + stars + it.desc + '</div>' +
+          '</div>' +
+          '<button class="primary" style="padding:6px 14px;font-size:12px">一键部署</button>';
+        row.querySelector('button').onclick = async function () {
+          var st = document.getElementById('deployStatus');
+          st.textContent = '正在克隆 ' + it.name + ' …';
+          var dep = await window.deskwrap.platformDeploy({ cloneUrl: it.cloneUrl, name: it.name });
+          if (!dep.ok) {
+            st.innerHTML = '部署失败: ' + dep.error +
+              ' — <button class="ghost" id="deployAiBtn" style="padding:4px 10px;font-size:12px">🤖 AI 诊断</button>';
+            document.getElementById('deployAiBtn').onclick = function () {
+              document.querySelector('[data-panel="log"]').click();
+              document.getElementById('agentGoal').value = '让克隆/部署成功';
+              document.getElementById('agentStartBtn').click();
+            };
+            return;
+          }
+          st.textContent = '✔ 克隆完成: ' + dep.dir;
+          document.querySelector('[data-panel="project"]').click();
+          loadProject(dep.dir, dep.cloned);
+        };
+        resultsEl.appendChild(row);
+      });
+    };
+
+    document.getElementById('addPlatBtn').onclick = async function () {
+      var name = document.getElementById('addPlatName').value.trim();
+      var search = document.getElementById('addPlatSearch').value.trim();
+      var clonePrefix = document.getElementById('addPlatClone').value.trim();
+      var st = document.getElementById('deployStatus');
+      if (!name || !search) { st.textContent = '请填写平台名和搜索 API'; return; }
+      var id = 'custom-' + name.toLowerCase().replace(/\s+/g, '-');
+      var plat = {
+        id: id, name: name, search: search,
+        clonePrefix: clonePrefix || '',
+        listPath: '',
+        map: { name: 'full_name', desc: 'description', clone: 'clone_url', url: 'html_url', stars: 'stargazers_count' },
+      };
+      var res = await window.deskwrap.platformAdd(plat);
+      st.textContent = res.ok ? '✔ 平台已添加（保存到当前项目配置）' : '添加失败: ' + res.error;
+      if (res.ok) loadPlatforms();
+    };
+
+    // ---------- env extended: VRAM + node versions ----------
+    async function loadEnvExtended() {
+      var data = await window.deskwrap.envExtended();
+      var vramEl = document.getElementById('vramInfo');
+      if (data.vram && data.vram.length) {
+        var vrams = data.vram.map(function (g) { return g.name + ': ' + (g.vramMB / 1024).toFixed(1) + ' GB'; }).join(' · ');
+        vramEl.innerHTML = '<b style="color:#8fd3ff">显存</b>: ' + vrams + '<br>' +
+          '<span style="color:#8b95a1">Q4 量化可跑: ≤' + (data.vram[0].vramMB / 1024 * 1.8).toFixed(0) +
+          'B 参数级 · FP16 可跑: ≤' + (data.vram[0].vramMB / 1024 * 0.65).toFixed(0) + 'B 参数级（估算）</span>';
+      } else {
+        vramEl.innerHTML = '<span style="color:#8b95a1">未检测到独立显卡显存（nvidia-smi 不可用）。本地大模型可用 CPU 推理或云 API。</span>';
+      }
+      var nvEl = document.getElementById('nodeVersionsInfo');
+      var mgr = data.versionManager || {};
+      var mgrNames = Object.keys(mgr);
+      nvEl.innerHTML = data.nodeVersions.length
+        ? '已安装版本: ' + data.nodeVersions.map(function (v) { return '<b style="color:#8fd3ff">' + v + '</b>'; }).join(' ')
+        : '未检测到多版本 Node 安装目录。';
+      if (mgrNames.length) {
+        nvEl.innerHTML += '<br><span style="color:#6fd38c">✔ 版本管理器已就绪: ' + mgrNames.join(' · ') + '</span>';
+      } else {
+        nvEl.innerHTML += '<br><span style="color:#f5b04a">未安装 nvm / volta / fnm —— ' +
+          '<a href="#" id="nvmLink" style="color:#6ea8ff">安装 nvm-windows 可管理多版本</a></span>';
+        nvEl.querySelector('#nvmLink').onclick = function (e) {
+          e.preventDefault();
+          window.deskwrap.openExternal('https://github.com/coreybutler/nvm-windows/releases');
+        };
+      }
+    }
+    loadEnvExtended();
+
+    // ---------- AI save / test ----------
+    document.getElementById('aiSaveBtn').onclick = async function () {
+      var st = document.getElementById('aiStatus');
+      var provider = document.getElementById('aiProvider').value;
+      var key = document.getElementById('aiKey').value.trim();
+      var model = document.getElementById('aiModel').value.trim();
+      var baseUrl = document.getElementById('aiBase').value.trim();
+      if (provider !== 'custom' && !key) { st.textContent = '请先填入 API Key'; st.className = 'status'; return; }
+      var confirmed = window.confirm('是否将 API Key 保存到本地配置文件？\n（保存在项目目录的 deskwrap.config.json，不会上传）');
+      if (!confirmed) return;
+      var ai = { enabled: true, provider: provider, apiKey: key, model: model, baseUrl: baseUrl };
+      if (currentDir) {
+        await window.deskwrap.saveConfig(currentDir, Object.assign({}, collectConfig(), { ai: ai }));
+        st.textContent = '✔ 已保存到本地配置（下次启动自动加载）';
+      } else {
+        var res = await window.deskwrap.saveAiToCurrent(ai);
+        st.textContent = res.ok ? '✔ 已保存' : '保存失败: ' + (res.error || '');
+      }
+      st.className = 'status ok';
+      document.getElementById('aiEnabled').checked = true;
+      refreshModelList();
+    };
+
+    document.getElementById('aiTestBtn').onclick = async function () {
+      var st = document.getElementById('aiStatus');
+      st.textContent = '正在测试连接…';
+      var res = await window.deskwrap.aiTest({
+        provider: document.getElementById('aiProvider').value,
+        apiKey: document.getElementById('aiKey').value.trim(),
+        baseUrl: document.getElementById('aiBase').value.trim(),
+        model: document.getElementById('aiModel').value.trim(),
+      });
+      if (res.ok) { st.textContent = '✔ 连接成功: ' + (res.model || '') + ' | 回复: ' + (res.content || ''); st.className = 'status ok'; }
+      else { st.textContent = '连接失败: ' + res.error; st.className = 'status'; }
+    };
+
+    // ---------- logs & diagnosis ----------
+    async function refreshLog() {
+      var log = await window.deskwrap.getLog();
+      document.getElementById('logView').value = log.join('\n') || '（暂无日志，先运行项目）';
+    }
+
+    document.getElementById('refreshLogBtn').onclick = refreshLog;
+
+    // Shared: the AI form values (same source as the connection test), so
+    // diagnosis and the agent honor a key typed without saving.
+    function collectAiForm() {
+      return {
+        provider: document.getElementById('aiProvider').value,
+        apiKey: document.getElementById('aiKey').value.trim(),
+        model: document.getElementById('aiModel').value.trim(),
+        baseUrl: document.getElementById('aiBase').value.trim(),
+        enabled: document.getElementById('aiEnabled').checked,
+      };
+    }
+
+    document.getElementById('aiBtn').onclick = async function () {
+      await refreshLog();
+      var resultEl = document.getElementById('aiResult');
+      resultEl.textContent = 'AI 正在分析日志（最长 60 秒）…';
+      var res = await window.deskwrap.aiDiagnose(collectAiForm());
+      resultEl.textContent = res.ok ? res.content : '诊断失败: ' + res.error;
+    };
+
+    // ---------- agent ----------
+    var agentFlowEl = document.getElementById('agentFlow');
+    var agentStartBtn = document.getElementById('agentStartBtn');
+    var agentStopBtn = document.getElementById('agentStopBtn');
+
+    window.deskwrap.onAgentEvent(function (ev) {
+      var ts = new Date().toLocaleTimeString();
+      if (ev.type === 'ai') {
+        agentFlowEl.textContent += '\n[' + ts + '] 🤖 AI: ' + ev.content;
+      } else if (ev.type === 'tool') {
+        agentFlowEl.textContent += '\n[' + ts + '] 🔧 ' + ev.content;
+      } else if (ev.type === 'goal') {
+        agentFlowEl.textContent += '\n[' + ts + '] 🎯 ' + ev.content;
+      } else if (ev.type === 'error') {
+        agentFlowEl.textContent += '\n[' + ts + '] ⚠ ' + ev.content;
+      } else if (ev.type === 'done') {
+        agentFlowEl.textContent += '\n[' + ts + '] ' + (ev.success ? '✅' : '❌') + ' 智能体结束: ' + ev.content;
+        agentStartBtn.style.display = '';
+        agentStopBtn.style.display = 'none';
+      }
+      agentFlowEl.scrollTop = agentFlowEl.scrollHeight;
+    });
+
+    agentStartBtn.onclick = async function () {
+      var goal = document.getElementById('agentGoal').value;
+      agentFlowEl.textContent = '[' + new Date().toLocaleTimeString() + '] 🚀 智能体启动，目标: ' + goal + '\n';
+      agentStartBtn.style.display = 'none';
+      agentStopBtn.style.display = '';
+      var res = await window.deskwrap.agentStart(Object.assign({ goal: goal, dir: currentDir }, collectAiForm()));
+      if (res && res.error) {
+        agentFlowEl.textContent += '\n❌ 启动失败: ' + res.error;
+      } else if (res && !res.ok) {
+        agentFlowEl.textContent += '\n[' + new Date().toLocaleTimeString() + '] ❌ 未达成: ' + res.summary;
+      }
+      agentStartBtn.style.display = '';
+      agentStopBtn.style.display = 'none';
+    };
+
+    agentStopBtn.onclick = async function () {
+      await window.deskwrap.agentStop();
+      agentFlowEl.textContent += '\n⏹ 正在停止…';
+    };
+
+    // Load an existing config into the form (project dir already has one).
+    window.addEventListener('DOMContentLoaded', async function () {
+      var info = await window.deskwrap.getInfo();
+      if (info && info.configPath) {
+        var dir = info.configPath.replace(/[\\/]deskwrap\.config\.json$/, '');
+        if (dir) {
+          currentDir = dir;
+          document.getElementById('dirDisplay').textContent = dir;
+          document.getElementById('configCard').style.display = 'block';
+          document.getElementById('cwd').value = dir.replace(/\\/g, '/');
+          try {
+            var cfg = info.config;
+            if (cfg) {
+              document.getElementById('appName').value = cfg.appName || '';
+              document.getElementById('command').value = ((cfg.service && cfg.service.command) || []).join(' ');
+              document.getElementById('port').value = (cfg.service && cfg.service.port) || 0;
+              document.getElementById('tray').checked = !!cfg.tray;
+              document.getElementById('autoRestart').checked = !!cfg.autoRestart;
+              document.getElementById('proxyEnabled').checked = !!(cfg.proxy && cfg.proxy.enabled);
+              document.getElementById('proxyUrl').value = (cfg.proxy && cfg.proxy.url) || '';
+              document.getElementById('aiEnabled').checked = !!(cfg.ai && cfg.ai.enabled);
+              document.getElementById('aiProvider').value = (cfg.ai && cfg.ai.provider) || 'glm';
+              document.getElementById('aiKey').value = (cfg.ai && cfg.ai.apiKey) || '';
+              document.getElementById('aiModel').value = (cfg.ai && cfg.ai.model) || '';
+              document.getElementById('aiBase').value = (cfg.ai && cfg.ai.baseUrl) || '';
+              if (cfg.ai && cfg.ai.provider === 'custom') document.getElementById('aiBaseRow').style.display = 'block';
+              document.getElementById('outDir').value = cfg.outDir || '';
+              document.getElementById('projectsDir').value = cfg.projectsDir || '';
+            }
+          } catch (e) { /* ignore */ }
+        }
+      }
+    });
+  </script>
+</body>
+</html>

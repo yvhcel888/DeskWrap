@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>DeskWrap</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #0f1115;
+      color: #e6e8eb;
+      display: flex; align-items: center; justify-content: center;
+      height: 100vh;
+    }
+    .card { text-align: center; max-width: 480px; padding: 40px; }
+    .logo {
+      width: 72px; height: 72px; margin: 0 auto 24px; border-radius: 16px;
+      background: linear-gradient(135deg, #4f8cff, #7c5cff);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 34px; font-weight: 800; color: #fff;
+    }
+    h1 { font-size: 20px; margin-bottom: 10px; }
+    p { color: #9aa3af; font-size: 14px; line-height: 1.7; margin-bottom: 8px; }
+    code {
+      background: #1c2027; padding: 2px 8px; border-radius: 6px;
+      color: #8fd3ff; font-size: 13px;
+    }
+    .status { margin-top: 20px; font-size: 13px; color: #f5b04a; min-height: 18px; }
+    .btn {
+      margin-top: 24px; padding: 10px 28px; border: none; border-radius: 8px;
+      background: #4f8cff; color: #fff; font-size: 14px; cursor: pointer;
+    }
+    .btn:hover { background: #3d7aef; }
+    .btn.hidden { display: none; }
+    .spinner {
+      width: 28px; height: 28px; margin: 24px auto 0;
+      border: 3px solid #2a2f38; border-top-color: #4f8cff;
+      border-radius: 50%; animation: spin 0.9s linear infinite;
+    }
+    .spinner.hidden { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">D</div>
+    <h1 id="title">正在启动服务…</h1>
+    <p>正在等待本地服务就绪</p>
+    <p>地址：<code id="url">…</code></p>
+    <div class="spinner" id="spinner"></div>
+    <div class="status" id="status"></div>
+    <button class="btn hidden" id="retry">重试</button>
+  </div>
+  <script>
+    // window.__DW_INIT__ is injected by the Go side before this page loads:
+    // { url, appName, error?: "timeout" }
+    var init = window.__DW_INIT__ || {};
+    var url = init.url || '';
+    var appName = init.appName || 'DeskWrap';
+    var failed = init.error === 'timeout';
+
+    document.title = appName;
+    document.getElementById('url').textContent = url;
+
+    if (failed) {
+      document.getElementById('title').textContent = '服务启动超时';
+      document.getElementById('status').textContent = '请检查服务日志，或点击重试。';
+      document.getElementById('spinner').classList.add('hidden');
+      var btn = document.getElementById('retry');
+      btn.classList.remove('hidden');
+      btn.onclick = async function () {
+        btn.disabled = true;
+        document.getElementById('status').textContent = '正在重启服务…';
+        var ok = await window.deskwrap.retry();
+        if (!ok) {
+          document.getElementById('status').textContent = '服务仍然无法启动，请检查配置。';
+          btn.disabled = false;
+        }
+      };
+    }
+  </script>
+</body>
+</html>

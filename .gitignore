@@ -1,0 +1,27 @@
+# Build outputs (keep the source tree clean)
+/build/
+/release/
+*.exe
+*.dll
+*.zip
+versioninfo.syso
+
+
+# WebView2 runtime data
+deskwrap-webview-data/
+
+# Local user config — may contain API keys, never commit
+deskwrap.config.json
+
+# Internal handoff notes (not part of the public repo)
+PROJECT_STATUS.md
+
+# Internal promotion plan and ad-hoc dev scripts (kept in build/tools/ locally)
+PROMOTION.md
+/tools/cdp-*.mjs
+/tools/wv2-cs-*.ps1
+
+# OS / editor noise
+*.log
+.DS_Store
+Thumbs.db
