@@ -58,6 +58,21 @@ func findCmdInPath(program string) string {
 	return ""
 }
 
+// findAllCmdInPath returns every .cmd/.bat shim for program on PATH (in order).
+func findAllCmdInPath(program string) []string {
+	var out []string
+	dirs := filepath.SplitList(os.Getenv("PATH"))
+	for _, dir := range dirs {
+		for _, ext := range []string{".cmd", ".bat"} {
+			full := filepath.Join(dir, program+ext)
+			if fileExists(full) {
+				out = append(out, full)
+			}
+		}
+	}
+	return out
+}
+
 // unwrapShim parses a cmd shim and returns the real node.exe + entry script.
 // Three patterns, in order of specificity (matching the proven JS logic):
 //  1. npm 9+ variable pattern: SET "NODE_EXE=..." + SET "NPX_CLI_JS=..."
@@ -123,62 +138,81 @@ type resolvedCommand struct {
 }
 
 // resolveWindowsCommand maps a user-supplied program to a spawnable command.
-//
-// ENOENT fallback chain (stale PATH entries happen when the user moved or
-// uninstalled Node): if the node.exe parsed from the shim no longer exists,
-// retry with a working system node. If that fails too, fall back to running
-// the shim through cmd.exe.
+// For bare names (pnpm, npm, node...) it searches PATH for shims and tries
+// each one until it finds a recognizable pattern that unwraps to a real
+// executable.  This handles tools like DSH / volta / fnm that insert their
+// own non-standard shims earlier on PATH.
 func resolveWindowsCommand(program string, args []string) resolvedCommand {
 	lower := strings.ToLower(program)
 	isShimName := strings.HasSuffix(lower, ".cmd") || strings.HasSuffix(lower, ".bat")
 
-	shim := ""
+	var shims []string
 	if isShimName {
 		if fileExists(program) {
-			shim = program
+			shims = []string{program}
 		}
 	} else if !strings.ContainsAny(program, `\/`) {
-		// bare name (npm, pnpm...) - maybe a shim on PATH
-		shim = findCmdInPath(program)
+		// bare name (npm, pnpm...) - collect all shims on PATH
+		shims = findAllCmdInPath(program)
 	}
 
-	if shim == "" {
+	if len(shims) == 0 {
 		return resolvedCommand{program: program, args: args, viaShell: false}
 	}
 
-	r := unwrapShim(shim, args)
-	if r.viaShell {
-		return r
-	}
-	if fileExists(r.program) {
-		return r
-	}
-
-	// The parsed node.exe doesn't exist (stale PATH): retry with system node.
-	if sysNode := findCmdInPath("node"); sysNode != "" {
-		if s := unwrapShim(sysNode, nil); !s.viaShell && fileExists(s.program) && len(r.args) > 0 {
-			return resolvedCommand{
-				program:  s.program,
-				args:     append([]string{r.args[0]}, args...),
-				viaShell: false,
+	// Try each shim in PATH order; prefer one that unwraps cleanly.
+	for _, shim := range shims {
+		r := unwrapShim(shim, args)
+		if r.viaShell {
+			continue // non-standard shim (DSH/volta/etc.) — try the next one
+		}
+		if fileExists(r.program) {
+			return r
+		}
+		// The parsed node.exe doesn't exist (stale PATH): retry with system node.
+		if sysNode := findCmdInPath("node"); sysNode != "" {
+			if s := unwrapShim(sysNode, nil); !s.viaShell && fileExists(s.program) && len(r.args) > 0 {
+				return resolvedCommand{
+					program:  s.program,
+					args:     append([]string{r.args[0]}, args...),
+					viaShell: false,
+				}
 			}
 		}
 	}
-	// Last resort: cmd.exe with a hidden console.
-	return resolvedCommand{program: shim, args: args, viaShell: true}
+	// No shim could be unwrapped — use the first one via cmd.exe.
+	return resolvedCommand{program: shims[0], args: args, viaShell: true}
 }
 
 // applyHiddenFlags marks the child process to run without a console window
 // and in its own process group (so taskkill /T reaches the whole tree).
+// Merge-style: preserves any existing SysProcAttr fields (e.g. CmdLine).
 func applyHiddenFlags(c *exec.Cmd) {
-	c.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: createNoWindow | createNewProcGroup,
-		HideWindow:    true,
+	if c.SysProcAttr == nil {
+		c.SysProcAttr = &syscall.SysProcAttr{}
 	}
+	c.SysProcAttr.CreationFlags |= createNoWindow | createNewProcGroup
+	c.SysProcAttr.HideWindow = true
 }
 
-// shellCommand runs an already-joined command line through cmd.exe.
+// shellCommand runs a command through cmd.exe /d [/s] /c.
+// When the program path contains spaces (e.g. "DSH Desktop"), Go's
+// exec.Command auto-quoting conflicts with cmd /s, so we bypass Go's
+// command-line assembly via SysProcAttr.CmdLine.  Without /s, cmd.exe
+// preserves quotes when there are exactly two " and no special chars
+// between them, so the path stays intact.
 func shellCommand(program string, args []string) *exec.Cmd {
+	if strings.ContainsAny(program, " \t") {
+		argPart := ""
+		if len(args) > 0 {
+			argPart = " " + strings.Join(args, " ")
+		}
+		c := exec.Command("cmd.exe")
+		c.SysProcAttr = &syscall.SysProcAttr{
+			CmdLine: `cmd.exe /d /c "` + program + `"` + argPart,
+		}
+		return c
+	}
 	line := program
 	if len(args) > 0 {
 		line += " " + strings.Join(args, " ")
