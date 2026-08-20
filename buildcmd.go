@@ -140,6 +140,7 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 	delete(portableCfg, "proxy")
 	delete(portableCfg, "platformTokens")
 	delete(portableCfg, "projectsDir")
+	delete(portableCfg, "outDir") // local absolute path — meaningless on the recipient's machine
 	svcMap["env"] = map[string]any{}
 	cfgDst := filepath.Join(outDir, "deskwrap.config.json")
 	if err := writeRawConfig(cfgDst, portableCfg); err != nil {
