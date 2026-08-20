@@ -91,13 +91,21 @@ func startService(cfg map[string]any) error {
 	program, args := cmd[0], cmd[1:]
 	viaShell := runtime.GOOS != "windows"
 	if runtime.GOOS == "windows" {
-		// Portable builds ship a bundled Node.js in <exe_dir>/node/.
-		// Go's exec.Command resolves "node" against the *parent* PATH at
-		// Start() time (not c.Env), so on a machine without Node we must
-		// point the program at the bundled binary explicitly.
-		if (program == "node" || program == "node.exe") && !strings.ContainsAny(program, `\/`) {
-			if bundled := filepath.Join(filepath.Dir(mustExecutable()), "node", "node.exe"); fileExists(bundled) {
-				program = bundled
+		// Portable builds ship a bundled Node.js in <exe_dir>/node/ and a
+		// bundled Python in <exe_dir>/python/. Go's exec.Command resolves
+		// "node"/"python" against the *parent* PATH at Start() time (not
+		// c.Env), so on a machine without them we must point the program at
+		// the bundled binary explicitly.
+		progBase := strings.ToLower(filepath.Base(program))
+		if (progBase == "node" || progBase == "node.exe" || progBase == "python" || progBase == "python3" || progBase == "python.exe") && !strings.ContainsAny(program, `\/`) {
+			if progBase == "node" || progBase == "node.exe" {
+				if bundled := filepath.Join(filepath.Dir(mustExecutable()), "node", "node.exe"); fileExists(bundled) {
+					program = bundled
+				}
+			} else {
+				if bundled := filepath.Join(filepath.Dir(mustExecutable()), "python", "python.exe"); fileExists(bundled) {
+					program = bundled
+				}
 			}
 		}
 		r := resolveWindowsCommand(program, args)
@@ -117,10 +125,17 @@ func startService(cfg map[string]any) error {
 	}
 	c.Dir = cwd
 	c.Env = mergedEnv(cfg)
-	// Prepend the bundled node/ directory to PATH so the packaged
-	// node.exe is found first (the recipient may not have Node installed).
-	if bundledNode := filepath.Join(filepath.Dir(mustExecutable()), "node"); dirExists(bundledNode) {
-		c.Env = append(c.Env, "PATH="+bundledNode+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Prepend the bundled node/ and python/ directories to PATH so the
+	// packaged binaries are found first (the recipient may not have them).
+	exeDir := filepath.Dir(mustExecutable())
+	extra := ""
+	for _, sub := range []string{"node", "python"} {
+		if dirExists(filepath.Join(exeDir, sub)) {
+			extra += filepath.Join(exeDir, sub) + string(os.PathListSeparator)
+		}
+	}
+	if extra != "" {
+		c.Env = append(c.Env, "PATH="+extra+os.Getenv("PATH"))
 	}
 	applyHiddenFlags(c)
 
@@ -239,6 +254,11 @@ func needsDepsInstall(dir string, command []string) string {
 			return "pnpm install"
 		}
 	case prog == "pip" || prog == "pip3" || prog == "python" || prog == "python3":
+		// Portable builds ship a bundled Python with dependencies already
+		// installed — never show a "pip install" hint to the recipient.
+		if bundled := filepath.Join(filepath.Dir(mustExecutable()), "python", "python.exe"); fileExists(bundled) {
+			return ""
+		}
 		req := filepath.Join(dir, "requirements.txt")
 		if fileExists(req) {
 			return "pip install -r requirements.txt"
@@ -273,12 +293,17 @@ func needsRuntimeInstall(command []string) string {
 	default:
 		return ""
 	}
-	// Portable builds ship a bundled Node.js in <exe_dir>/node/. When it is
-	// present, the node-family runtime counts as provided even if the
-	// recipient's PATH has no node/pnpm/npm/yarn — startService points the
-	// program at the bundled binary explicitly.
+	// Portable builds ship a bundled Node.js in <exe_dir>/node/ and a
+	// bundled Python in <exe_dir>/python/. When present, the runtime counts
+	// as provided even if the recipient's PATH has nothing installed —
+	// startService points the program at the bundled binary explicitly.
 	if name == "node" || name == "pnpm" || name == "npm" || name == "yarn" {
 		if bundled := filepath.Join(filepath.Dir(mustExecutable()), "node", "node.exe"); fileExists(bundled) {
+			return ""
+		}
+	}
+	if name == "python" {
+		if bundled := filepath.Join(filepath.Dir(mustExecutable()), "python", "python.exe"); fileExists(bundled) {
 			return ""
 		}
 	}
