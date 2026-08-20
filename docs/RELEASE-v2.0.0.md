@@ -8,12 +8,12 @@
 ## 亮点 / Highlights
 
 - **单 Go 可执行文件 (~8.5MB) + 系统 WebView2**：不捆绑 Electron，Win11 自带运行时，缺失自动静默安装
-- **打包产物双击即用**：`build` 自动捆绑项目依赖（node_modules）+ 对应版本 Node.js，对方解压双击即可，**无需安装 Node/Python/浏览器**
+- **打包产物双击即用**：`build` 自动捆绑项目依赖 + 对应运行时 —— Node.js 项目内置 Node.js（含 node_modules），Python 项目（Gradio/Flask/FastAPI/Streamlit 等）自动创建便携 Python 并 pip 安装依赖，对方解压双击即可，**无需安装 Node/Python/浏览器**
 - **轻量产物**：打包体积只有源码 + 依赖（无 Electron 250MB 冗余）；纯工具本体 zip 仅 ~3.6MB
 - **零工具链**：单 exe 即出包，无需 Rust/Cargo/Node
 - **自动检测**：Vite/Next.js/Flask/FastAPI/Gradio/Streamlit/Go/pnpm workspace 的启动命令与端口
 - **进程树治理**：关窗即清服务进程树（taskkill /T /F），cmd shim 直启防黑窗
-- **去密打包**：产物不包含你的 deskwrap.config.json（可能含 API Key）、.env、代理与 AI 配置
+- **去密打包**：产物不包含你的 deskwrap.config.json（可能含 API Key）、.env、代理与 AI 配置；zip 内运行时完整（exe + 配置 + app/ + node/ 或 python/），解压即用
 - **AI 日志诊断**：粘贴报错日志，AI 给出修复建议（24 家提供商，需自备 API Key）
 - **开源项目一键体验**：GitHub/Gitee/HuggingFace/魔搭/GitLab/Codeberg 搜索 → 克隆 → 跑起来 → 打包
 - **7 面板管理 GUI**（项目/环境/代理/AI/部署/日志诊断/设置）+ CLI（init/run/build/detect/gui/help）
