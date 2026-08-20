@@ -314,10 +314,7 @@ func createServiceWindow(cfg map[string]any) {
 		w.Init(`(function(){ window.deskwrap = window.deskwrap || {}; window.deskwrap.retry = function(){ return __dw_retry(); }; })();`)
 
 		// Check if the runtime (Node/Python) or dependencies are missing.
-		cwd := cfgStr(cfg, "service.cwd")
-		if cwd == "" {
-			cwd, _ = os.Getwd()
-		}
+		cwd := resolveServiceCwd(cfg)
 		cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
 		rtMissing := needsRuntimeInstall(cmdArr)
 		installCmd := needsDepsInstall(cwd, cmdArr)
@@ -608,8 +605,6 @@ const jsDeskWrapObject = `(function(){
   deskwrap.buildApp = __dw_buildApp;
   deskwrap.getLog = __dw_getLog;
   deskwrap.aiDiagnose = __dw_aiDiagnose;
-  deskwrap.agentStart = __dw_agentStart;
-  deskwrap.agentStop = __dw_agentStop;
   deskwrap.checkEnv = __dw_checkEnv;
   deskwrap.envExtended = __dw_envExtended;
   deskwrap.detectEngines = __dw_detectEngines;
@@ -625,8 +620,6 @@ const jsDeskWrapObject = `(function(){
   deskwrap.platformSetToken = __dw_platformSetToken;
   deskwrap.getLocale = __dw_getLocale;
   deskwrap.setLocale = __dw_setLocale;
-  deskwrap.onAgentEvent = function(cb){ window.__onAgentEvent = cb; };
-  window.__onAgentEvent = window.__onAgentEvent || function(ev){};
   window.deskwrap = deskwrap;
 })();`
 
@@ -738,11 +731,23 @@ func guiHWND() uintptr {
 }
 
 func guiBuildApp(dir string, cfg map[string]any) map[string]any {
-	res := doBuild(dir, cfg)
-	if !res.ok {
-		return map[string]any{"ok": false, "error": res.err}
-	}
-	return map[string]any{"ok": true, "artifacts": res.artifacts}
+	// Build runs in a goroutine — doBuild copies hundreds of MB (node_modules
+	// + bundled Node.js) and would otherwise block the WebView2 main thread,
+	// freezing the whole GUI for minutes. The result is pushed back via
+	// window.__buildResult once finished.
+	go func() {
+		res := doBuild(dir, cfg)
+		if guiWin != nil {
+			js := fmt.Sprintf("window.__buildResult && window.__buildResult(%s);", jsonString(map[string]any{
+				"ok":        res.ok,
+				"error":     res.err,
+				"artifacts": res.artifacts,
+			}))
+			w := guiWin
+			w.Dispatch(func() { w.Eval(js) })
+		}
+	}()
+	return map[string]any{"ok": true, "started": true}
 }
 
 func guiGetLog() []string {

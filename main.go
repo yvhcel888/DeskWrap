@@ -107,10 +107,7 @@ func main() {
 	// the service window will show a guidance page and start the service
 	// after the runtime/deps are ready (createServiceWindow handles this).
 	cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
-	cwd := cfgStr(cfg, "service.cwd")
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
+	cwd := resolveServiceCwd(cfg)
 	rtMissing := needsRuntimeInstall(cmdArr)
 	depsMissing := needsDepsInstall(cwd, cmdArr)
 	if rtMissing == "" && depsMissing == "" {

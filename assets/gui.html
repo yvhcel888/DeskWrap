@@ -101,11 +101,6 @@
       background: #171b22; border: 1px solid #262c36; border-radius: 8px;
       padding: 10px; line-height: 1.7; font-size: 12.5px; color: #c9d1db;
     }
-    #agentFlow {
-      margin-top: 12px; font-size: 12.5px; color: #c9d1db; line-height: 1.8;
-      max-height: 320px; overflow: auto; white-space: pre-wrap; background: #10141a;
-      border: 1px solid #262c36; border-radius: 8px; padding: 10px;
-    }
     .hint { font-size: 11.5px; color: #6b7684; margin-top: 4px; }
   </style>
 </head>
@@ -305,23 +300,6 @@
       <div class="field" style="margin-top:10px">
         <label>AI 诊断结果</label>
         <div id="aiResult">点击「AI 诊断」开始。需要先在 AI 设置中启用并填入 Key。</div>
-      </div>
-      <div class="card" style="margin-top:16px">
-        <h2 style="font-size:14px;margin-bottom:10px">🤖 智能体（让 AI 自主修复直到成功）</h2>
-        <p class="hint" style="margin-bottom:12px">
-          智能体会分析环境与日志，自动执行命令（安装依赖）、修改配置、重试打包/运行，
-          直到目标达成（最多 15 步）。危险命令（格式化、删系统目录）会被拦截。
-        </p>
-        <div class="row">
-          <select id="agentGoal" style="flex:1">
-            <option value="让项目运行成功">🎯 让项目运行成功</option>
-            <option value="让打包成功">🎯 让打包成功</option>
-            <option value="让克隆/部署成功">🎯 让克隆/部署成功</option>
-          </select>
-          <button class="primary" id="agentStartBtn">▶ 开始智能体</button>
-          <button class="danger" id="agentStopBtn" style="display:none">■ 停止</button>
-        </div>
-        <div id="agentFlow"></div>
       </div>
     </section>
   </main>
@@ -533,10 +511,13 @@
 
     document.getElementById('buildBtn').onclick = async function () {
       var cfg = collectConfig();
-      setStatus('正在打包（几秒钟）…');
+      setStatus('正在打包（node_modules + Node.js 运行时，可能需要几分钟）…');
+      window.__buildResult = function (res) {
+        if (res && res.ok) setStatus('✔ 打包完成: ' + (res.artifacts || []).join(', '), true);
+        else setStatus('打包失败: ' + (res && res.error), false);
+      };
       var res = await window.deskwrap.buildApp(currentDir, cfg);
-      if (res.ok) setStatus('✔ 打包完成: ' + (res.artifacts || []).join(', '), true);
-      else setStatus('打包失败: ' + res.error);
+      if (res && !res.ok) setStatus('打包失败: ' + res.error);
     };
 
     // ---------- proxy ----------
@@ -648,8 +629,7 @@
               ' — <button class="ghost" id="deployAiBtn" style="padding:4px 10px;font-size:12px">🤖 AI 诊断</button>';
             document.getElementById('deployAiBtn').onclick = function () {
               document.querySelector('[data-panel="log"]').click();
-              document.getElementById('agentGoal').value = '让克隆/部署成功';
-              document.getElementById('agentStartBtn').click();
+              document.getElementById('aiBtn').click();
             };
             return;
           }
@@ -772,49 +752,6 @@
       resultEl.textContent = 'AI 正在分析日志（最长 60 秒）…';
       var res = await window.deskwrap.aiDiagnose(collectAiForm());
       resultEl.textContent = res.ok ? res.content : '诊断失败: ' + res.error;
-    };
-
-    // ---------- agent ----------
-    var agentFlowEl = document.getElementById('agentFlow');
-    var agentStartBtn = document.getElementById('agentStartBtn');
-    var agentStopBtn = document.getElementById('agentStopBtn');
-
-    window.deskwrap.onAgentEvent(function (ev) {
-      var ts = new Date().toLocaleTimeString();
-      if (ev.type === 'ai') {
-        agentFlowEl.textContent += '\n[' + ts + '] 🤖 AI: ' + ev.content;
-      } else if (ev.type === 'tool') {
-        agentFlowEl.textContent += '\n[' + ts + '] 🔧 ' + ev.content;
-      } else if (ev.type === 'goal') {
-        agentFlowEl.textContent += '\n[' + ts + '] 🎯 ' + ev.content;
-      } else if (ev.type === 'error') {
-        agentFlowEl.textContent += '\n[' + ts + '] ⚠ ' + ev.content;
-      } else if (ev.type === 'done') {
-        agentFlowEl.textContent += '\n[' + ts + '] ' + (ev.success ? '✅' : '❌') + ' 智能体结束: ' + ev.content;
-        agentStartBtn.style.display = '';
-        agentStopBtn.style.display = 'none';
-      }
-      agentFlowEl.scrollTop = agentFlowEl.scrollHeight;
-    });
-
-    agentStartBtn.onclick = async function () {
-      var goal = document.getElementById('agentGoal').value;
-      agentFlowEl.textContent = '[' + new Date().toLocaleTimeString() + '] 🚀 智能体启动，目标: ' + goal + '\n';
-      agentStartBtn.style.display = 'none';
-      agentStopBtn.style.display = '';
-      var res = await window.deskwrap.agentStart(Object.assign({ goal: goal, dir: currentDir }, collectAiForm()));
-      if (res && res.error) {
-        agentFlowEl.textContent += '\n❌ 启动失败: ' + res.error;
-      } else if (res && !res.ok) {
-        agentFlowEl.textContent += '\n[' + new Date().toLocaleTimeString() + '] ❌ 未达成: ' + res.summary;
-      }
-      agentStartBtn.style.display = '';
-      agentStopBtn.style.display = 'none';
-    };
-
-    agentStopBtn.onclick = async function () {
-      await window.deskwrap.agentStop();
-      agentFlowEl.textContent += '\n⏹ 正在停止…';
     };
 
     // Load an existing config into the form (project dir already has one).

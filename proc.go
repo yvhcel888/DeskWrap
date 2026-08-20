@@ -91,14 +91,20 @@ func startService(cfg map[string]any) error {
 	program, args := cmd[0], cmd[1:]
 	viaShell := runtime.GOOS != "windows"
 	if runtime.GOOS == "windows" {
+		// Portable builds ship a bundled Node.js in <exe_dir>/node/.
+		// Go's exec.Command resolves "node" against the *parent* PATH at
+		// Start() time (not c.Env), so on a machine without Node we must
+		// point the program at the bundled binary explicitly.
+		if (program == "node" || program == "node.exe") && !strings.ContainsAny(program, `\/`) {
+			if bundled := filepath.Join(filepath.Dir(mustExecutable()), "node", "node.exe"); fileExists(bundled) {
+				program = bundled
+			}
+		}
 		r := resolveWindowsCommand(program, args)
 		program, args, viaShell = r.program, r.args, r.viaShell
 	}
 
-	cwd := cfgStr(cfg, "service.cwd")
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
+	cwd := resolveServiceCwd(cfg)
 
 	fmt.Printf("[DeskWrap] %s: %s %s\n", t("startService"), program, strings.Join(args, " "))
 	fmt.Printf("[DeskWrap] %s: %s\n", t("workDir"), cwd)
@@ -266,6 +272,15 @@ func needsRuntimeInstall(command []string) string {
 		name = "git"
 	default:
 		return ""
+	}
+	// Portable builds ship a bundled Node.js in <exe_dir>/node/. When it is
+	// present, the node-family runtime counts as provided even if the
+	// recipient's PATH has no node/pnpm/npm/yarn — startService points the
+	// program at the bundled binary explicitly.
+	if name == "node" || name == "pnpm" || name == "npm" || name == "yarn" {
+		if bundled := filepath.Join(filepath.Dir(mustExecutable()), "node", "node.exe"); fileExists(bundled) {
+			return ""
+		}
 	}
 	// Check if the binary exists on PATH.
 	binName := name

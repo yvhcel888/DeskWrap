@@ -36,6 +36,7 @@ var buildExclude = map[string]bool{
 	".DS_Store":            true,
 	"Thumbs.db":            true,
 	"deskwrap-webview-data": true,
+	"deskwrap.config.json": true,  // user config may contain API keys — only the portable config is shipped
 	"release":              true,
 	"dist":                 true,
 	"__pycache__":          true,
@@ -45,6 +46,7 @@ var buildExclude = map[string]bool{
 	".idea":                true,
 	"build":                true,
 	"out":                  true,
+	".env":                 true,   // may contain secrets
 }
 
 // sanitizeName produces a filesystem-safe artifact name.
@@ -126,12 +128,19 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		}
 	}
 
-	// 6) Build a portable config: cwd relative, command rewritten for bundled node.
+	// 6) Build a portable config: cwd relative, command rewritten for bundled node,
+	//    and strip sensitive fields (API keys, proxy URLs, project-local paths).
 	portableCfg := deepMerge(map[string]any{}, cfg)
 	portableCfg["service"] = deepMerge(map[string]any{}, cfgMap(portableCfg, "service"))
 	svcMap, _ := portableCfg["service"].(map[string]any)
 	svcMap["cwd"] = "app"
 	svcMap["command"] = rewriteCommandForPortable(svcMap["command"], appDir)
+	// Strip user-specific / sensitive fields.
+	delete(portableCfg, "ai")
+	delete(portableCfg, "proxy")
+	delete(portableCfg, "platformTokens")
+	delete(portableCfg, "projectsDir")
+	svcMap["env"] = map[string]any{}
 	cfgDst := filepath.Join(outDir, "deskwrap.config.json")
 	if err := writeRawConfig(cfgDst, portableCfg); err != nil {
 		return buildResult{ok: false, err: "cannot write portable config: " + err.Error()}
@@ -205,6 +214,7 @@ func copyProjectDir(src, dst string, skipDirs ...string) error {
 	}
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) { return nil } // skip missing dirs/files
 			return err
 		}
 		rel, _ := filepath.Rel(src, path)
@@ -215,11 +225,14 @@ func copyProjectDir(src, dst string, skipDirs ...string) error {
 			return filepath.SkipDir
 		}
 		name := filepath.Base(rel)
-		if info.IsDir() && buildExclude[name] {
+		if buildExclude[name] {
 			// Never apply the exclude list inside node_modules — those
 			// directories (dist/, build/, etc.) contain actual package code.
 			if !strings.Contains(filepath.ToSlash(rel), "node_modules/") {
-				return filepath.SkipDir
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil // skip excluded files (deskwrap.config.json, .env, ...)
 			}
 		}
 		dstPath := filepath.Join(dst, rel)

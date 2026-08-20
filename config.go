@@ -192,6 +192,22 @@ func mustExecutable() string {
 	return p
 }
 
+// resolveServiceCwd resolves service.cwd to an absolute path.  Portable
+// builds use a relative cwd ("app") that must be resolved against the
+// executable's directory — the packaged app is double-clicked from
+// anywhere, so a cwd relative to the *launch* directory would be invalid.
+func resolveServiceCwd(cfg map[string]any) string {
+	cwd := cfgStr(cfg, "service.cwd")
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+		return cwd
+	}
+	if !filepath.IsAbs(cwd) {
+		cwd = filepath.Join(filepath.Dir(mustExecutable()), cwd)
+	}
+	return filepath.Clean(cwd)
+}
+
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && !st.IsDir()
