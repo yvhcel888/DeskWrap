@@ -161,7 +161,7 @@ func watchServiceExit(c *exec.Cmd, gen int, cfg map[string]any) {
 
 	if !quitting.Load() && cfgBool(cfg, "autoRestart") {
 		fmt.Printf("[DeskWrap] %s\n", t("autoRestarting"))
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		if !quitting.Load() {
 			_ = startService(cfg)
 		}
@@ -193,7 +193,7 @@ func waitForService(port int, timeout time.Duration, exitCh <-chan struct{}) boo
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 1500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			return true
@@ -201,7 +201,7 @@ func waitForService(port int, timeout time.Duration, exitCh <-chan struct{}) boo
 		select {
 		case <-exitCh:
 			return false
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(300 * time.Millisecond):
 		}
 	}
 	fmt.Printf("[DeskWrap] Service did not become ready on port %d within %s\n", port, timeout)

@@ -12,8 +12,19 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// envCache avoids re-spawning 6 subprocesses every time checkEnvironment is
+// called (GUI loadProject, agent, etc.).  Results are cached for 5 minutes.
+var (
+	envMu    sync.Mutex
+	envCache map[string]any
+	envStamp time.Time
+)
+
+const envCacheTTL = 5 * time.Minute
 
 var runtimeHints = map[string]string{
 	"node":   "Node.js: https://nodejs.org/",
@@ -49,7 +60,7 @@ func runVersion(cmd string, args []string) string {
 	}()
 	select {
 	case <-done:
-	case <-time.After(8 * time.Second):
+	case <-time.After(3 * time.Second):
 		killProcessTree(c.Process.Pid)
 		<-done
 		return ""
@@ -65,15 +76,48 @@ func runVersion(cmd string, args []string) string {
 }
 
 // checkEnvironment reports the versions of the common toolchain.
+// Results are cached for 5 minutes (the environment doesn't change mid-session)
+// and the 6 version probes run in parallel (total ≈ max(individual) instead
+// of sum).
 func checkEnvironment() map[string]any {
-	return map[string]any{
-		"node":   runVersion("node", []string{"--version"}),
-		"npm":    runVersion("npm", []string{"--version"}),
-		"pnpm":   runVersion("pnpm", []string{"--version"}),
-		"yarn":   runVersion("yarn", []string{"--version"}),
-		"git":    runVersion("git", []string{"--version"}),
-		"python": runVersion(pythonName(), []string{"--version"}),
+	envMu.Lock()
+	if envCache != nil && time.Since(envStamp) < envCacheTTL {
+		out := envCache
+		envMu.Unlock()
+		return out
 	}
+	envMu.Unlock()
+
+	// Parallel probes — each goroutine writes one key.
+	type probe struct{ key, cmd string; args []string }
+	probes := []probe{
+		{"node", "node", []string{"--version"}},
+		{"npm", "npm", []string{"--version"}},
+		{"pnpm", "pnpm", []string{"--version"}},
+		{"yarn", "yarn", []string{"--version"}},
+		{"git", "git", []string{"--version"}},
+		{"python", pythonName(), []string{"--version"}},
+	}
+	result := map[string]any{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, p := range probes {
+		wg.Add(1)
+		go func(p probe) {
+			v := runVersion(p.cmd, p.args)
+			mu.Lock()
+			result[p.key] = v
+			mu.Unlock()
+			wg.Done()
+		}(p)
+	}
+	wg.Wait()
+
+	envMu.Lock()
+	envCache = result
+	envStamp = time.Now()
+	envMu.Unlock()
+	return result
 }
 
 func pythonName() string {
