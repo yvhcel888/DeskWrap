@@ -63,17 +63,31 @@
   </div>
   <script>
     // window.__DW_INIT__ is injected by the Go side before this page loads:
-    // { url, appName, error?: "timeout", depsCmd?: "pnpm install" }
+    // { url, appName, error?: "timeout", depsCmd?: "pnpm install", rtMissing?: "需要安装 Node.js: ..." }
     var init = window.__DW_INIT__ || {};
     var url = init.url || '';
     var appName = init.appName || 'DeskWrap';
     var failed = init.error === 'timeout';
     var depsCmd = init.depsCmd || '';
+    var rtMissing = init.rtMissing || '';
     var installBtn = document.getElementById('installBtn');
     var depsBox = document.getElementById('depsBox');
 
     document.title = appName;
     document.getElementById('url').textContent = url;
+
+    // ---------- runtime missing state ----------
+    if (rtMissing) {
+      document.getElementById('title').textContent = '缺少运行时';
+      document.getElementById('sub').textContent = '该服务需要额外的运行时环境才能启动。';
+      document.getElementById('spinner').classList.add('hidden');
+      document.getElementById('status').textContent = rtMissing;
+      // Auto-select the hint text for easy copy.
+      var statusEl = document.getElementById('status');
+      statusEl.style.userSelect = 'text';
+      statusEl.style.cursor = 'text';
+      statusEl.title = '点击可选中复制';
+    }
 
     // ---------- deps missing state ----------
     if (depsCmd) {

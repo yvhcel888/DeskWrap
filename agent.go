@@ -1,14 +1,9 @@
-// DeskWrap - built-in ops agent + AI provider plumbing.
+// DeskWrap - AI diagnosis and provider plumbing.
 //
-// A small, auditable agent loop: the configured LLM analyzes the state
-// (logs, env, errors), proposes ONE action per turn as strict JSON, the
-// executor runs it, and the result is fed back. Repeats until the goal is
-// reached or the iteration budget (15) runs out. Six tools, no chaining,
-// no arbitrary file access - only project-scoped operations.
-//
-// All AI traffic goes through appFetch (proxy-aware): the packaged app must
-// respect the user's optional proxy, and Go's default HTTP client does not
-// automatically pick up a GUI-set proxy URL.
+// The AI diagnosis reads the service log, identifies the root cause, and
+// suggests fixes.  All AI traffic goes through appFetch (proxy-aware):
+// the packaged app must respect the user's optional proxy, and Go's
+// default HTTP client does not automatically pick up a GUI-set proxy URL.
 package main
 
 import (
@@ -21,17 +16,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"time"
-)
-
-const (
-	maxIterations = 15
-	maxOutput     = 2000
 )
 
 // --- AI providers (OpenAI-compatible) --------------------------------------
@@ -208,8 +195,8 @@ func truncate(s string, n int) string {
 // aiSettingsFromOpts resolves the effective AI settings for GUI-triggered
 // actions: the configured settings overridden by the GUI form values (the
 // same values aiTest uses). The user may have typed a key and only run the
-// connection test without saving, so diagnosis and the agent must honor the
-// form just like the test does.
+// connection test without saving, so diagnosis must honor the form just
+// like the test does.
 func aiSettingsFromOpts(opts map[string]any) map[string]any {
 	cfg := getAiConfig()
 	if opts == nil {
@@ -217,8 +204,6 @@ func aiSettingsFromOpts(opts map[string]any) map[string]any {
 	}
 	provider := fmt.Sprint(orDefault(opts["provider"], fmt.Sprint(cfg["provider"])))
 	prov := providerOr(provider)
-	// base/model: explicit form value > config value (only when the config
-	// was resolved for the same provider) > provider default.
 	base := fmt.Sprint(orDefault(opts["baseUrl"], ""))
 	if base == "" && fmt.Sprint(cfg["provider"]) == provider {
 		base = fmt.Sprint(cfg["base"])
@@ -355,11 +340,11 @@ func aiModels(opts map[string]any) map[string]any {
 	candidates := []string{root + "/models", strings.TrimSuffix(base, "/chat/completions") + "/models"}
 	lastErr := ""
 	for _, u := range candidates {
-		headers := map[string]any{}
+		headers := map[string]string{}
 		if key != "" {
 			headers["Authorization"] = "Bearer " + key
 		}
-		data, status, err := appFetch("GET", u, map[string]string{}, nil, 15*time.Second)
+		data, status, err := appFetch("GET", u, headers, nil, 15*time.Second)
 		if err != nil {
 			lastErr = err.Error()
 			continue
@@ -417,331 +402,4 @@ func sortStrings(s []string) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
-}
-
-// --- agent loop -------------------------------------------------------------
-
-var agentStopped atomic.Bool
-
-const agentSystemPrompt = `你是 DeskWrap 桌面工具的运维智能体。
-当前任务目标：%s
-
-环境信息：
-- 操作系统: %s
-- 项目目录: %s
-- 服务命令: %s
-- 端口: %d
-- 环境: %s
-
-你可以调用以下工具，每次回复必须是一个严格的 JSON 对象（不要 markdown 围栏、不要多余文字）：
-1. {"action":"run_command","args":{"command":"<shell命令>","cwd":"<可选工作目录>"}}
-   执行 shell 命令（如安装依赖 pnpm install、跑构建脚本），返回输出尾部。禁止危险命令（格式化磁盘、删除系统目录等）。
-2. {"action":"write_config","args":{"patch":{"service":{"command":["npm","run","dev"],"port":3000}}}}
-   合并修改当前项目的 deskwrap.config.json。改完通常需要重试 build 或 run_service。
-3. {"action":"read_log","args":{}}
-   读取服务日志与构建日志尾部，用于定位报错。
-4. {"action":"check_env","args":{}}
-   检查 Node/npm/pnpm/yarn/git/python 是否可用。
-5. {"action":"build","args":{}}
-   执行桌面应用打包（可能耗时数分钟）。
-6. {"action":"run_service","args":{}}
-   停止旧服务后按当前配置重新启动服务并打开窗口。
-
-工作方式：
-- 先 check_env / read_log 了解现状，定位问题根因；
-- 每次只做一个动作，根据结果决定下一步；
-- 依赖没装就先 run_command 安装；端口冲突就 write_config 换端口；代理问题就 write_config 调整 proxy；
-- 当目标达成时回复 {"done":true,"success":true,"summary":"<完成说明>"}；
-- 如果无法解决（缺权限、网络不通等），回复 {"done":true,"success":false,"summary":"<失败原因与建议>"}；
-- 不要放弃得太快，多尝试不同修复路径。`
-
-// parseAction extracts the first {...} JSON block from an LLM reply
-// (tolerates markdown fences and surrounding text).
-func parseAction(text string) map[string]any {
-	cleaned := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(text, "```json", ""), "```", ""))
-	start := strings.Index(cleaned, "{")
-	end := strings.LastIndex(cleaned, "}")
-	if start == -1 || end <= start {
-		return nil
-	}
-	var m map[string]any
-	if err := json.Unmarshal([]byte(cleaned[start:end+1]), &m); err != nil {
-		return nil
-	}
-	return m
-}
-
-type agentOpts struct {
-	goal        string
-	ai          map[string]any
-	ctx         map[string]any
-	executor    func(action string, args map[string]any) map[string]any
-	goalReached func() bool
-	onEvent     func(ev map[string]any)
-	stopFlag    func() bool
-}
-
-func runAgent(opts agentOpts) map[string]any {
-	messages := []map[string]any{
-		{
-			"role": "system",
-			"content": fmt.Sprintf(agentSystemPrompt,
-				opts.goal, runtimeOS(), orEmpty(opts.ctx["dir"]),
-				jsonString(opts.ctx["command"]), orInt(opts.ctx["port"]),
-				jsonString(opts.ctx["env"])),
-		},
-		{"role": "user", "content": "开始执行任务。目标：" + opts.goal},
-	}
-
-	lastSummary := ""
-	for i := 0; i < maxIterations; i++ {
-		if opts.stopFlag != nil && opts.stopFlag() {
-			return map[string]any{"ok": false, "summary": "用户停止了智能体", "iterations": i}
-		}
-
-		content, err := callChat(
-			fmt.Sprint(opts.ai["base"]), fmt.Sprint(opts.ai["model"]), fmt.Sprint(opts.ai["apiKey"]),
-			messages, 120*time.Second, 0.2, 1200)
-		if err != nil {
-			opts.onEvent(map[string]any{"type": "error", "content": "AI 调用失败: " + err.Error()})
-			return map[string]any{"ok": false, "summary": "AI 调用失败: " + err.Error(), "iterations": i}
-		}
-
-		action := parseAction(content)
-		if action == nil {
-			opts.onEvent(map[string]any{"type": "ai", "content": content, "parseError": true})
-			messages = append(messages,
-				map[string]any{"role": "assistant", "content": content},
-				map[string]any{"role": "user", "content": "回复必须是严格的 JSON 对象，例如 {\"action\":\"check_env\",\"args\":{}} 或 {\"done\":true,...}。请重新按格式回复。"})
-			continue
-		}
-
-		if done, _ := action["done"].(bool); done {
-			success, _ := action["success"].(bool)
-			lastSummary, _ = action["summary"].(string)
-			if lastSummary == "" {
-				lastSummary = "完成"
-			}
-			opts.onEvent(map[string]any{"type": "done", "content": lastSummary, "success": success})
-			return map[string]any{"ok": success, "summary": lastSummary, "iterations": i + 1}
-		}
-
-		tool, _ := action["action"].(string)
-		args := map[string]any{}
-		if a, ok := action["args"].(map[string]any); ok {
-			args = a
-		}
-		opts.onEvent(map[string]any{"type": "ai", "content": fmt.Sprintf("%s(%s)", tool, truncate(jsonString(args), 200))})
-
-		result := opts.executor(tool, args)
-		output := truncate(fmt.Sprint(result["output"]), maxOutput)
-		okStr := "失败"
-		if ok, _ := result["ok"].(bool); ok {
-			okStr = "成功"
-		}
-		opts.onEvent(map[string]any{"type": "tool", "content": fmt.Sprintf("%s -> %s\n%s", tool, okStr, truncate(output, 400))})
-
-		messages = append(messages,
-			map[string]any{"role": "assistant", "content": content},
-			map[string]any{"role": "user", "content": fmt.Sprintf(
-				"工具 %s 执行%s。输出：\n%s\n\n请根据结果决定下一步。若目标已达成回复 {\"done\":true,...}。",
-				tool, okStr, orDefaultStr(output, "（无输出）"))})
-
-		if opts.goalReached != nil && opts.goalReached() {
-			opts.onEvent(map[string]any{"type": "goal", "content": "目标检测已达成"})
-			return map[string]any{"ok": true, "summary": "目标已达成", "iterations": i + 1}
-		}
-	}
-
-	return map[string]any{
-		"ok":         false,
-		"summary":    fmt.Sprintf("达到最大迭代次数 (%d)，智能体停止。%s", maxIterations, lastSummary),
-		"iterations": maxIterations,
-	}
-}
-
-func orEmpty(v any) string {
-	if v == nil {
-		return "未选择"
-	}
-	return fmt.Sprint(v)
-}
-
-func orDefaultStr(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
-}
-
-func orInt(v any) int {
-	switch n := v.(type) {
-	case int:
-		return n
-	case float64:
-		return int(n)
-	}
-	return 0
-}
-
-// --- executor: the six tools ------------------------------------------------
-
-var dangerousCommandRe = regexp.MustCompile(`rm\s+-rf?\s+[\/\\](\s|$)|format\s+[a-z]:|del\s+\/s\/q\s+[a-z]:\\|mkfs`)
-
-// executeAgentTool runs one agent tool against the current project.
-func executeAgentTool(action string, args map[string]any) map[string]any {
-	switch action {
-	case "run_command":
-		command := strings.TrimSpace(fmt.Sprint(orDefault(args["command"], "")))
-		if command == "" {
-			return map[string]any{"ok": false, "output": "空命令"}
-		}
-		if dangerousCommandRe.MatchString(command) {
-			return map[string]any{"ok": false, "output": "命令被安全策略拦截（危险操作）"}
-		}
-		cfgMu.RLock()
-		cwd := fmt.Sprint(orDefault(args["cwd"], cfgStr(config, "service.cwd")))
-		cfgMu.RUnlock()
-		if cwd == "" {
-			cwd, _ = os.Getwd()
-		}
-
-		var c *exec.Cmd
-		if regexp.MustCompile(`[&|><]`).MatchString(command) {
-			c = shellCommandRaw(command)
-		} else {
-			parts := strings.Fields(command)
-			program, cmdArgs := parts[0], parts[1:]
-			r := resolveWindowsCommand(program, cmdArgs)
-			if r.viaShell {
-				c = shellCommand(r.program, r.args)
-			} else {
-				c = exec.Command(r.program, r.args...)
-			}
-		}
-		c.Dir = cwd
-		applyHiddenFlags(c)
-		var out strings.Builder
-		stdout, err := c.StdoutPipe()
-		if err != nil {
-			return map[string]any{"ok": false, "output": err.Error()}
-		}
-		stderr, err := c.StderrPipe()
-		if err != nil {
-			return map[string]any{"ok": false, "output": err.Error()}
-		}
-		if err := c.Start(); err != nil {
-			return map[string]any{"ok": false, "output": err.Error()}
-		}
-		go func() {
-			var dec decodeChunk
-			buf := make([]byte, 4096)
-			for {
-				n, err := stdout.Read(buf)
-				if n > 0 {
-					text := dec.decode(buf[:n])
-					out.WriteString(text)
-					serviceLog.push(text)
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-		go func() {
-			var dec decodeChunk
-			buf := make([]byte, 4096)
-			for {
-				n, err := stderr.Read(buf)
-				if n > 0 {
-					text := dec.decode(buf[:n])
-					out.WriteString(text)
-					serviceLog.push(text)
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-		done := make(chan struct{})
-		go func() { _ = c.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(300 * time.Second):
-			killProcessTree(c.Process.Pid)
-			<-done
-			return map[string]any{"ok": false, "output": "命令超时（300 秒）" + truncate(out.String(), 1500)}
-		}
-		ok := c.ProcessState != nil && c.ProcessState.Success()
-		return map[string]any{"ok": ok, "output": truncate(out.String(), 1500)}
-
-	case "write_config":
-		cfgMu.RLock()
-		path := configPath
-		cfgMu.RUnlock()
-		if path == "" {
-			return map[string]any{"ok": false, "output": "尚未选择项目（无配置文件）"}
-		}
-		current, err := readRawConfig(path)
-		if err != nil {
-			return map[string]any{"ok": false, "output": err.Error()}
-		}
-		patch := map[string]any{}
-		if p, ok := args["patch"].(map[string]any); ok {
-			patch = p
-		}
-		merged := deepMerge(current, patch)
-		if err := writeRawConfig(path, merged); err != nil {
-			return map[string]any{"ok": false, "output": err.Error()}
-		}
-		cfgMu.Lock()
-		config = deepMerge(defaults, merged)
-		configPath = path
-		cfgMu.Unlock()
-		return map[string]any{"ok": true, "output": "配置已更新: " + path}
-
-	case "read_log":
-		tail := append(serviceLog.tail(40), buildLog.tail(20)...)
-		out := strings.Join(tail, "\n")
-		if out == "" {
-			out = "（暂无日志）"
-		}
-		return map[string]any{"ok": true, "output": out}
-
-	case "check_env":
-		return map[string]any{"ok": true, "output": jsonString(checkEnvironment())}
-
-	case "build":
-		cfgMu.RLock()
-		path := configPath
-		cfgCopy := config
-		cfgMu.RUnlock()
-		if path == "" {
-			return map[string]any{"ok": false, "output": "尚未选择项目（无配置文件）"}
-		}
-		dir := filepath.Dir(path)
-		res := doBuild(dir, cfgCopy)
-		if !res.ok {
-			return map[string]any{"ok": false, "output": res.err}
-		}
-		return map[string]any{"ok": true, "output": "打包成功: " + strings.Join(res.artifacts, ", ")}
-
-	case "run_service":
-		cfgMu.RLock()
-		cfgCopy := config
-		cfgMu.RUnlock()
-		stopService()
-		if err := startService(cfgCopy); err != nil {
-			return map[string]any{"ok": false, "output": "服务启动失败（命令无法执行）: " + err.Error()}
-		}
-		ensureServiceWindow(cfgCopy)
-		return map[string]any{"ok": true, "output": "服务已启动"}
-
-	default:
-		return map[string]any{"ok": false, "output": "未知工具: " + action}
-	}
-}
-
-func shellCommandRaw(command string) *exec.Cmd {
-	return exec.Command("cmd.exe", "/d", "/s", "/c", command)
 }

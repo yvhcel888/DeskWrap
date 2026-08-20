@@ -111,6 +111,11 @@ func startService(cfg map[string]any) error {
 	}
 	c.Dir = cwd
 	c.Env = mergedEnv(cfg)
+	// Prepend the bundled node/ directory to PATH so the packaged
+	// node.exe is found first (the recipient may not have Node installed).
+	if bundledNode := filepath.Join(filepath.Dir(mustExecutable()), "node"); dirExists(bundledNode) {
+		c.Env = append(c.Env, "PATH="+bundledNode+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	applyHiddenFlags(c)
 
 	stdout, err := c.StdoutPipe()
@@ -198,6 +203,11 @@ func needsDepsInstall(dir string, command []string) string {
 	if len(command) == 0 {
 		return ""
 	}
+	// If the runtime itself is missing, deps check is moot — let the caller
+	// handle the runtime-missing case first.
+	if rt := needsRuntimeInstall(command); rt != "" {
+		return ""
+	}
 	prog := strings.ToLower(filepath.Base(command[0]))
 	switch {
 	case prog == "pnpm" || prog == "pnpm.cmd":
@@ -229,6 +239,51 @@ func needsDepsInstall(dir string, command []string) string {
 		}
 	}
 	return ""
+}
+
+// needsRuntimeInstall checks whether the required runtime (node, python, etc.)
+// is available on the system.  Returns a human-readable guidance string like
+// "需要安装 Node.js: https://nodejs.org/" if the runtime is missing, or "" if
+// it is found.
+func needsRuntimeInstall(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	prog := strings.ToLower(filepath.Base(command[0]))
+	var name string
+	switch {
+	case prog == "node" || prog == "node.exe":
+		name = "node"
+	case prog == "pnpm" || prog == "pnpm.cmd":
+		name = "pnpm"
+	case prog == "npm" || prog == "npm.cmd" || prog == "npx" || prog == "npx.cmd":
+		name = "npm"
+	case prog == "yarn" || prog == "yarn.cmd":
+		name = "yarn"
+	case prog == "python" || prog == "python3" || prog == "pip" || prog == "pip3":
+		name = "python"
+	case prog == "git":
+		name = "git"
+	default:
+		return ""
+	}
+	// Check if the binary exists on PATH.
+	binName := name
+	if name == "python" && runtime.GOOS == "windows" {
+		binName = "python"
+	}
+	if _, err := exec.LookPath(binName); err == nil {
+		return ""
+	}
+	if name == "python" && runtime.GOOS != "windows" {
+		if _, err := exec.LookPath("python3"); err == nil {
+			return ""
+		}
+	}
+	if hint, ok := runtimeHints[name]; ok {
+		return "需要安装 " + hint
+	}
+	return "需要安装 " + name
 }
 
 // waitForService polls localhost:port until it accepts connections, the

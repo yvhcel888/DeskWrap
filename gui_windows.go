@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -314,15 +313,21 @@ func createServiceWindow(cfg map[string]any) {
 		_ = w.Bind("__dw_retry", func() map[string]any { return guiRetry(cfg) })
 		w.Init(`(function(){ window.deskwrap = window.deskwrap || {}; window.deskwrap.retry = function(){ return __dw_retry(); }; })();`)
 
-		// Check if project dependencies are missing (node_modules/ etc.).
+		// Check if the runtime (Node/Python) or dependencies are missing.
 		cwd := cfgStr(cfg, "service.cwd")
 		if cwd == "" {
 			cwd, _ = os.Getwd()
 		}
 		cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
+		rtMissing := needsRuntimeInstall(cmdArr)
 		installCmd := needsDepsInstall(cwd, cmdArr)
 
-		if installCmd != "" {
+		if rtMissing != "" {
+			// Runtime missing: show guidance page with install link.
+			initParams["rtMissing"] = rtMissing
+			w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
+			w.SetHtml(errorHTML)
+		} else if installCmd != "" {
 			// Deps missing: show install page, keep message pump running.
 			// runInstallDeps will start the service after installing.
 			initParams["depsCmd"] = installCmd
@@ -640,11 +645,6 @@ func bindGuiAPI(w webview2.WebView) {
 		"__dw_buildApp":   func(dir string, cfg map[string]any) map[string]any { return guiBuildApp(dir, cfg) },
 		"__dw_getLog":     func() []string { return guiGetLog() },
 		"__dw_aiDiagnose": func(opts map[string]any) map[string]any { return aiDiagnose(opts) },
-		"__dw_agentStart": func(opts map[string]any) map[string]any { return guiAgentStart(opts) },
-		"__dw_agentStop": func() map[string]any {
-			agentStopped.Store(true)
-			return map[string]any{"ok": true}
-		},
 		"__dw_checkEnv":      func() map[string]any { return checkEnvironment() },
 		"__dw_envExtended":   func() map[string]any { return guiEnvExtended() },
 		"__dw_detectEngines": func(dir string) map[string]any { return guiDetectEngines(dir) },
@@ -670,17 +670,6 @@ func bindGuiAPI(w webview2.WebView) {
 		_ = w.Bind(name, f)
 	}
 	w.Init(jsDeskWrapObject)
-}
-
-// broadcastAgentEvent pushes an agent event into the GUI via the event
-// callback registered by gui.html (window.__onAgentEvent).
-func broadcastAgentEvent(ev map[string]any) {
-	if guiWin == nil {
-		return
-	}
-	js := "window.__onAgentEvent && window.__onAgentEvent(" + jsonString(ev) + ");"
-	w := guiWin
-	w.Dispatch(func() { w.Eval(js) })
 }
 
 // --- handler implementations --------------------------------------------------
@@ -763,71 +752,6 @@ func guiGetLog() []string {
 		out = append(out, b...)
 	}
 	return out
-}
-
-func guiAgentStart(opts map[string]any) map[string]any {
-	ai := aiSettingsFromOpts(opts)
-	if enabled, _ := ai["enabled"].(bool); !enabled {
-		return map[string]any{"ok": false, "error": "AI 未启用（请先在 AI 设置开启并填 Key）"}
-	}
-	if ai["apiKey"] == "" && !ai["noKey"].(bool) {
-		return map[string]any{"ok": false, "error": "未配置 API Key"}
-	}
-
-	goal, _ := opts["goal"].(string)
-	if goal == "" {
-		goal = "让项目运行成功"
-	}
-	dir, _ := opts["dir"].(string)
-	workDir := dir
-	if workDir == "" {
-		cfgMu.RLock()
-		if configPath != "" {
-			workDir = filepath.Dir(configPath)
-		}
-		cfgMu.RUnlock()
-	}
-
-	cfgMu.RLock()
-	cmdArr, _ := resolveCommand(pickPath(config, "service.command"))
-	port := cfgInt(config, "service.port")
-	cfgMu.RUnlock()
-
-	ctx := map[string]any{"dir": workDir, "command": cmdArr, "port": port, "env": checkEnvironment()}
-
-	agentStopped.Store(false)
-	return runAgent(agentOpts{
-		goal:     goal,
-		ai:       ai,
-		ctx:      ctx,
-		executor: executeAgentTool,
-		goalReached: func() bool {
-			if regexp.MustCompile(`打包|build`).MatchString(goal) {
-				cfgMu.RLock()
-				outDir := cfgStr(config, "outDir")
-				cfgMu.RUnlock()
-				if outDir == "" && workDir != "" {
-					outDir = filepath.Join(workDir, "release")
-				}
-				if dirExists(outDir) {
-					for _, f := range safeReaddir(outDir) {
-						lf := strings.ToLower(f)
-						if strings.HasSuffix(lf, ".exe") || strings.HasSuffix(lf, ".zip") ||
-							strings.HasSuffix(lf, ".dmg") || strings.HasSuffix(lf, ".appimage") {
-							return true
-						}
-					}
-				}
-				return false
-			}
-			if regexp.MustCompile(`运行|run|启动`).MatchString(goal) {
-				return portListening(port)
-			}
-			return false
-		},
-		onEvent:  broadcastAgentEvent,
-		stopFlag: func() bool { return agentStopped.Load() },
-	})
 }
 
 func guiEnvExtended() map[string]any {

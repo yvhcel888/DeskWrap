@@ -2,9 +2,9 @@
 //
 // Packages the project for cross-machine distribution:
 //   - Shell (exe + WebView2Loader.dll)  – the native launcher
-//   - Project source (app/)             – the service code
-//   - Config (deskwrap.config.json)     – service.cwd relativized to "app/"
-//   - Optionally bundled node_modules   – for no-install-first-run (future --with-deps)
+//   - Project source (app/)             – the service code + node_modules
+//   - Portable Node.js (node/)          – bundled runtime, recipient doesn't need it
+//   - Config (deskwrap.config.json)     – service.cwd relativized, command rewritten
 //
 // "Building" = copy files + zip.  Seconds, not minutes; megabytes, not
 // hundreds of megabytes.
@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -27,9 +28,11 @@ type buildResult struct {
 }
 
 // buildExclude patterns are excluded when copying the project directory.
+// Note: node_modules is intentionally NOT excluded — the packaged app
+// ships with dependencies pre-installed so the recipient can double-click
+// and run without needing to install anything.
 var buildExclude = map[string]bool{
 	".git":                 true,
-	"node_modules":         true,
 	".DS_Store":            true,
 	"Thumbs.db":            true,
 	"deskwrap-webview-data": true,
@@ -61,7 +64,7 @@ func sanitizeName(s string) string {
 func doBuild(dir string, cfg map[string]any) buildResult {
 	buildLog.reset()
 
-	// 1) Persist the config into the project (same as the original).
+	// 1) Persist the config into the project.
 	target := filepath.Join(dir, "deskwrap.config.json")
 	if err := writeRawConfig(target, cfg); err != nil {
 		return buildResult{ok: false, err: "cannot write config: " + err.Error()}
@@ -109,26 +112,32 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		}
 	}
 
-	// 4) Copy the project directory into outDir/app/.
-	//    The bundled app runs as if cwd = the exe directory; the config
-	//    points service.cwd to "app/" so the service finds its code.
+	// 4) Copy the project directory into outDir/app/ (including node_modules).
 	appDir := filepath.Join(outDir, "app")
 	fmt.Printf("[DeskWrap] Copying project %s -> %s\n", dir, appDir)
 	if err := copyProjectDir(dir, appDir, outDir); err != nil {
 		return buildResult{ok: false, err: "cannot copy project: " + err.Error()}
 	}
 
-	// 5) Build a portable config: cwd relative to the exe directory.
+	// 5) Bundle portable Node.js — the recipient doesn't need it installed.
+	if runtime.GOOS == "windows" {
+		if err := bundleNodeRuntime(outDir); err != nil {
+			return buildResult{ok: false, err: "cannot bundle Node.js: " + err.Error()}
+		}
+	}
+
+	// 6) Build a portable config: cwd relative, command rewritten for bundled node.
 	portableCfg := deepMerge(map[string]any{}, cfg)
 	portableCfg["service"] = deepMerge(map[string]any{}, cfgMap(portableCfg, "service"))
 	svcMap, _ := portableCfg["service"].(map[string]any)
 	svcMap["cwd"] = "app"
+	svcMap["command"] = rewriteCommandForPortable(svcMap["command"], appDir)
 	cfgDst := filepath.Join(outDir, "deskwrap.config.json")
 	if err := writeRawConfig(cfgDst, portableCfg); err != nil {
 		return buildResult{ok: false, err: "cannot write portable config: " + err.Error()}
 	}
 
-	// 6) Zip: exe + config + sidecars + app/ directory.
+	// 7) Zip: exe + config + sidecars + app/ + node/.
 	zipPath := filepath.Join(outDir, sanitizeName(appName)+"-win64.zip")
 	zipFiles := []string{exeDst, cfgDst}
 	zipFiles = append(zipFiles, sidecars...)
@@ -138,6 +147,53 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 
 	buildLog.push(fmt.Sprintf("[DeskWrap] Built %s (%s)", exeName, zipPath))
 	return buildResult{ok: true, artifacts: []string{exeDst, zipPath}}
+}
+
+// rewriteCommandForPortable rewrites the service command to use the bundled
+// node.exe directly instead of requiring pnpm/npm on the target machine.
+// For ["pnpm","run","dev"], it reads the "dev" script from package.json and
+// returns ["node","node_modules/.bin/vite"] (or equivalent).
+func rewriteCommandForPortable(cmd any, appDir string) any {
+	parts, _ := resolveCommand(cmd)
+	if len(parts) < 2 {
+		return cmd
+	}
+	prog := strings.ToLower(filepath.Base(parts[0]))
+	switch prog {
+	case "node", "node.exe":
+		return cmd // already uses node directly
+	case "pnpm", "pnpm.cmd", "npm", "npm.cmd", "yarn", "yarn.cmd":
+		scriptName := parts[len(parts)-1]
+		if len(parts) >= 3 && parts[1] == "run" {
+			scriptName = parts[2]
+		}
+		pkgPath := filepath.Join(appDir, "package.json")
+		if pkg, err := readRawConfig(pkgPath); err == nil {
+			if scripts, ok := pkg["scripts"].(map[string]any); ok {
+				if actual, ok := scripts[scriptName].(string); ok && actual != "" {
+					binary := strings.Fields(actual)[0]
+					// Find the real JS entry point from node_modules/<binary>/package.json
+					// (the .bin/ scripts are shell/batch wrappers that don't work with node).
+					binPkg := filepath.Join(appDir, "node_modules", binary, "package.json")
+					if bpkg, err2 := readRawConfig(binPkg); err2 == nil {
+						if binMap, ok := bpkg["bin"].(map[string]any); ok {
+							if entry, ok := binMap[binary].(string); ok {
+								fullEntry := filepath.Join(appDir, "node_modules", binary, entry)
+								if fileExists(fullEntry) {
+									return []string{"node", filepath.Join("node_modules", binary, entry)}
+								}
+							}
+						}
+					}
+					// Fallback: node -e with the script content (for code-like scripts).
+					return []string{"node", "-e", actual}
+				}
+			}
+		}
+		return cmd
+	default:
+		return cmd
+	}
 }
 
 // copyProjectDir copies the source tree to dst, skipping buildExclude entries
@@ -155,13 +211,16 @@ func copyProjectDir(src, dst string, skipDirs ...string) error {
 		if rel == "." {
 			return os.MkdirAll(dst, 0o755)
 		}
-		// Skip the output directory (release-cross/ etc.) if inside src.
 		if info.IsDir() && skip[filepath.Clean(path)] {
 			return filepath.SkipDir
 		}
 		name := filepath.Base(rel)
 		if info.IsDir() && buildExclude[name] {
-			return filepath.SkipDir
+			// Never apply the exclude list inside node_modules — those
+			// directories (dist/, build/, etc.) contain actual package code.
+			if !strings.Contains(filepath.ToSlash(rel), "node_modules/") {
+				return filepath.SkipDir
+			}
 		}
 		dstPath := filepath.Join(dst, rel)
 		if info.IsDir() {
@@ -169,6 +228,33 @@ func copyProjectDir(src, dst string, skipDirs ...string) error {
 		}
 		return copyFile(path, dstPath)
 	})
+}
+
+// bundleNodeRuntime copies the system Node.js (node.exe + npm/) into
+// outDir/node/ so the packaged app can run without Node installed on the
+// target machine.
+func bundleNodeRuntime(outDir string) error {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		return nil // no node — skip (guidance page handles it)
+	}
+	nodeDir := filepath.Join(outDir, "node")
+	if err := os.MkdirAll(nodeDir, 0o755); err != nil {
+		return err
+	}
+	dstNode := filepath.Join(nodeDir, "node.exe")
+	if err := copyFile(nodePath, dstNode); err != nil {
+		return err
+	}
+	fmt.Printf("[DeskWrap] Bundled Node.js %s -> %s\n", nodePath, dstNode)
+	npmDir := filepath.Join(filepath.Dir(nodePath), "node_modules", "npm")
+	if dirExists(npmDir) {
+		dstNpm := filepath.Join(nodeDir, "node_modules", "npm")
+		if err := copyProjectDir(npmDir, dstNpm); err == nil {
+			fmt.Printf("[DeskWrap] Bundled npm -> %s\n", dstNpm)
+		}
+	}
+	return nil
 }
 
 func mustRepoRoot() string {

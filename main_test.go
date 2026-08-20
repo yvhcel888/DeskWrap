@@ -94,38 +94,6 @@ func TestUnwrapShimNoFalsePositiveOnSetProg(t *testing.T) {
 	}
 }
 
-// --- agent JSON extraction ---------------------------------------------------
-
-func TestParseActionFormats(t *testing.T) {
-	cases := []struct {
-		in       string
-		wantAct  string
-		wantDone bool
-	}{
-		{`{"action":"check_env","args":{}}`, "check_env", false},
-		{"```json\n{\"action\":\"read_log\",\"args\":{}}\n```", "read_log", false},
-		{"前置文字 {\"done\":true,\"success\":true,\"summary\":\"ok\"} 后置", "", true},
-		{"not json at all", "", false},
-		{"{\"broken\":", "", false},
-	}
-	for _, c := range cases {
-		m := parseAction(c.in)
-		if c.wantDone {
-			if m == nil || m["done"] != true {
-				t.Fatalf("parseAction(%q) = %v, want done", c.in, m)
-			}
-			continue
-		}
-		if c.wantAct != "" {
-			if m == nil || m["action"] != c.wantAct {
-				t.Fatalf("parseAction(%q) = %v, want action %s", c.in, m, c.wantAct)
-			}
-		} else if m != nil {
-			t.Fatalf("parseAction(%q) = %v, want nil", c.in, m)
-		}
-	}
-}
-
 // --- config merging ----------------------------------------------------------
 
 func TestDeepMerge(t *testing.T) {
