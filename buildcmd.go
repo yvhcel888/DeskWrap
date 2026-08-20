@@ -1,11 +1,13 @@
 // DeskWrap - the build command.
 //
-// The radical simplification of the rewrite: packaging a project used to
-// mean running electron-builder with a nested Electron runtime (a 10-minute
-// 7z pass producing a 250MB artifact). Now the shell itself is a single
-// small executable - "building" an app is: copy the shell, drop the config
-// next to it, zip it up. No downloads, no toolchain, seconds instead of
-// minutes, ~8MB instead of 250MB.
+// Packages the project for cross-machine distribution:
+//   - Shell (exe + WebView2Loader.dll)  – the native launcher
+//   - Project source (app/)             – the service code
+//   - Config (deskwrap.config.json)     – service.cwd relativized to "app/"
+//   - Optionally bundled node_modules   – for no-install-first-run (future --with-deps)
+//
+// "Building" = copy files + zip.  Seconds, not minutes; megabytes, not
+// hundreds of megabytes.
 package main
 
 import (
@@ -22,6 +24,24 @@ type buildResult struct {
 	ok        bool
 	err       string
 	artifacts []string
+}
+
+// buildExclude patterns are excluded when copying the project directory.
+var buildExclude = map[string]bool{
+	".git":                 true,
+	"node_modules":         true,
+	".DS_Store":            true,
+	"Thumbs.db":            true,
+	"deskwrap-webview-data": true,
+	"release":              true,
+	"dist":                 true,
+	"__pycache__":          true,
+	".next":                true,
+	".nuxt":                true,
+	".vs":                  true,
+	".idea":                true,
+	"build":                true,
+	"out":                  true,
 }
 
 // sanitizeName produces a filesystem-safe artifact name.
@@ -89,15 +109,30 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		}
 	}
 
-	// 4) Config next to the exe (the shell reads it from its own directory).
-	cfgDst := filepath.Join(outDir, "deskwrap.config.json")
-	if err := copyFile(target, cfgDst); err != nil {
-		return buildResult{ok: false, err: "cannot copy config: " + err.Error()}
+	// 4) Copy the project directory into outDir/app/.
+	//    The bundled app runs as if cwd = the exe directory; the config
+	//    points service.cwd to "app/" so the service finds its code.
+	appDir := filepath.Join(outDir, "app")
+	fmt.Printf("[DeskWrap] Copying project %s -> %s\n", dir, appDir)
+	if err := copyProjectDir(dir, appDir, outDir); err != nil {
+		return buildResult{ok: false, err: "cannot copy project: " + err.Error()}
 	}
 
-	// 5) Zip everything into <AppName>-win64.zip.
+	// 5) Build a portable config: cwd relative to the exe directory.
+	portableCfg := deepMerge(map[string]any{}, cfg)
+	portableCfg["service"] = deepMerge(map[string]any{}, cfgMap(portableCfg, "service"))
+	svcMap, _ := portableCfg["service"].(map[string]any)
+	svcMap["cwd"] = "app"
+	cfgDst := filepath.Join(outDir, "deskwrap.config.json")
+	if err := writeRawConfig(cfgDst, portableCfg); err != nil {
+		return buildResult{ok: false, err: "cannot write portable config: " + err.Error()}
+	}
+
+	// 6) Zip: exe + config + sidecars + app/ directory.
 	zipPath := filepath.Join(outDir, sanitizeName(appName)+"-win64.zip")
-	if err := zipArtifacts(zipPath, exeDst, cfgDst, sidecars); err != nil {
+	zipFiles := []string{exeDst, cfgDst}
+	zipFiles = append(zipFiles, sidecars...)
+	if err := zipDir(zipPath, outDir, zipFiles); err != nil {
 		return buildResult{ok: false, err: "cannot create zip: " + err.Error()}
 	}
 
@@ -105,9 +140,38 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 	return buildResult{ok: true, artifacts: []string{exeDst, zipPath}}
 }
 
+// copyProjectDir copies the source tree to dst, skipping buildExclude entries
+// and the output directory itself (which may be inside the source tree).
+func copyProjectDir(src, dst string, skipDirs ...string) error {
+	skip := map[string]bool{}
+	for _, d := range skipDirs {
+		skip[filepath.Clean(d)] = true
+	}
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		if rel == "." {
+			return os.MkdirAll(dst, 0o755)
+		}
+		// Skip the output directory (release-cross/ etc.) if inside src.
+		if info.IsDir() && skip[filepath.Clean(path)] {
+			return filepath.SkipDir
+		}
+		name := filepath.Base(rel)
+		if info.IsDir() && buildExclude[name] {
+			return filepath.SkipDir
+		}
+		dstPath := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+		return copyFile(path, dstPath)
+	})
+}
+
 func mustRepoRoot() string {
-	// exeDir/.. only makes sense in the dev repo layout; for the packaged
-	// app this just returns the exe directory - harmless.
 	return filepath.Dir(filepath.Dir(mustExecutable()))
 }
 
@@ -128,7 +192,9 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func zipArtifacts(zipPath, exe, cfg string, sidecars []string) error {
+// zipDir adds files (by absolute path, relative to base) and the app/
+// subdirectory to the zip archive.
+func zipDir(zipPath, base string, extraFiles []string) error {
 	f, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -151,16 +217,19 @@ func zipArtifacts(zipPath, exe, cfg string, sidecars []string) error {
 		return err
 	}
 
-	if err := add(exe, filepath.Base(exe)); err != nil {
-		return err
-	}
-	if err := add(cfg, "deskwrap.config.json"); err != nil {
-		return err
-	}
-	for _, s := range sidecars {
-		if err := add(s, filepath.Base(s)); err != nil {
+	for _, path := range extraFiles {
+		rel, _ := filepath.Rel(base, path)
+		if err := add(path, filepath.ToSlash(rel)); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Add the app/ directory tree.
+	appDir := filepath.Join(base, "app")
+	return filepath.Walk(appDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(base, path)
+		return add(path, filepath.ToSlash(rel))
+	})
 }
