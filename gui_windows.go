@@ -10,6 +10,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -312,25 +313,45 @@ func createServiceWindow(cfg map[string]any) {
 		w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
 		_ = w.Bind("__dw_retry", func() map[string]any { return guiRetry(cfg) })
 		w.Init(`(function(){ window.deskwrap = window.deskwrap || {}; window.deskwrap.retry = function(){ return __dw_retry(); }; })();`)
-		w.SetHtml(errorHTML)
 
-		// Wait for the service, then load the real page.
-		go func() {
-			timeout := time.Duration(cfgInt(cfg, "service.readyTimeout")) * time.Millisecond
-			if timeout <= 0 {
-				timeout = 60 * time.Second
-			}
-			ok := waitForService(cfgInt(cfg, "service.port"), timeout, currentServiceExitCh())
-			w.Dispatch(func() {
-				if ok {
-					w.Navigate(url)
-				} else {
-					params := map[string]any{"url": url, "appName": cfgStr(cfg, "appName"), "error": "timeout"}
-					w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(params)))
-					w.SetHtml(errorHTML)
-				}
+		// Check if project dependencies are missing (node_modules/ etc.).
+		cwd := cfgStr(cfg, "service.cwd")
+		if cwd == "" {
+			cwd, _ = os.Getwd()
+		}
+		cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
+		installCmd := needsDepsInstall(cwd, cmdArr)
+
+		if installCmd != "" {
+			// Deps missing: show install page, keep message pump running.
+			// runInstallDeps will start the service after installing.
+			initParams["depsCmd"] = installCmd
+			w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
+			_ = w.Bind("__dw_installDeps", func() map[string]any {
+				return runInstallDeps(w, cfg, cwd, installCmd)
 			})
-		}()
+			w.Init(`(function(){ window.deskwrap.installDeps = function(){ return __dw_installDeps(); }; })();`)
+			w.SetHtml(errorHTML)
+		} else {
+			// Normal: show waiting page, start service poll.
+			w.SetHtml(errorHTML)
+			go func() {
+				timeout := time.Duration(cfgInt(cfg, "service.readyTimeout")) * time.Millisecond
+				if timeout <= 0 {
+					timeout = 60 * time.Second
+				}
+				ok := waitForService(cfgInt(cfg, "service.port"), timeout, currentServiceExitCh())
+				w.Dispatch(func() {
+					if ok {
+						w.Navigate(url)
+					} else {
+						params := map[string]any{"url": url, "appName": cfgStr(cfg, "appName"), "error": "timeout"}
+						w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(params)))
+						w.SetHtml(errorHTML)
+					}
+				})
+			}()
+		}
 
 		// Tray: closing hides the window, the service keeps running.
 		if cfgBool(cfg, "tray") {
@@ -370,6 +391,81 @@ func ensureServiceWindow(cfg map[string]any) {
 		return
 	}
 	createServiceWindow(cfg)
+}
+
+// runInstallDeps runs the auto-detected install command (pnpm install etc.)
+// on the webview's goroutine, streams output to the error.html depsBox,
+// then starts the service and navigates to it on success.
+func runInstallDeps(w webview2.WebView, cfg map[string]any, cwd, installCmd string) map[string]any {
+	parts := strings.Fields(installCmd)
+	program, cmdArgs := parts[0], parts[1:]
+
+	var c *exec.Cmd
+	if runtime.GOOS == "windows" {
+		r := resolveWindowsCommand(program, cmdArgs)
+		if r.viaShell {
+			c = shellCommand(r.program, r.args)
+		} else {
+			c = exec.Command(r.program, r.args...)
+		}
+	} else {
+		c = exec.Command(program, cmdArgs...)
+	}
+	c.Dir = cwd
+	applyHiddenFlags(c)
+
+	stdout, _ := c.StdoutPipe()
+	stderr, _ := c.StderrPipe()
+	if err := c.Start(); err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+
+	// Stream output to the depsBox div.
+	streamOutput := func(r io.ReadCloser) {
+		buf := make([]byte, 512)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				text := strings.ReplaceAll(string(buf[:n]), "\\", "\\\\")
+				text = strings.ReplaceAll(text, "`", "'")
+				text = strings.ReplaceAll(text, "\n", "\\n")
+				w.Dispatch(func() {
+					w.Eval("document.getElementById('depsBox').textContent += '" + text + "'")
+				})
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	go streamOutput(stdout)
+	go streamOutput(stderr)
+
+	_ = c.Wait()
+	ok := c.ProcessState != nil && c.ProcessState.Success()
+	if !ok {
+		return map[string]any{"ok": false, "error": "安装命令退出码非零，请检查上方日志。"}
+	}
+
+	// Install succeeded — start the service and wait for the port.
+	if err := startService(cfg); err != nil {
+		return map[string]any{"ok": false, "error": "依赖安装成功但服务启动失败: " + err.Error()}
+	}
+
+	port := cfgInt(cfg, "service.port")
+	timeout := time.Duration(cfgInt(cfg, "service.readyTimeout")) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	svcOK := waitForService(port, timeout, currentServiceExitCh())
+	if !svcOK {
+		return map[string]any{"ok": false, "error": "服务启动超时，请手动重试。"}
+	}
+
+	// Navigate to the service.
+	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+	w.Dispatch(func() { w.Navigate(url) })
+	return map[string]any{"ok": true}
 }
 
 func guiRetry(cfg map[string]any) map[string]any {

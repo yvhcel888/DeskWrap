@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -183,6 +184,51 @@ func stopServiceLocked() {
 	killProcessTree(serviceCmd.Process.Pid)
 	serviceCmd = nil
 	serviceGen++ // invalidate the exit watcher of the old process
+}
+
+// needsDepsInstall checks whether the project's dependencies appear to be
+// missing.  Returns the suggested install command ("pnpm install" etc.) or
+// "" if deps look present.
+//
+// The check uses robust markers that survive the "pnpm run creates a bare
+// node_modules" case: pnpm stores actual deps in node_modules/.pnpm/,
+// npm writes node_modules/.package-lock.json after install, and yarn
+// writes node_modules/.yarn-integrity.
+func needsDepsInstall(dir string, command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	prog := strings.ToLower(filepath.Base(command[0]))
+	switch {
+	case prog == "pnpm" || prog == "pnpm.cmd":
+		if !dirExists(filepath.Join(dir, "node_modules", ".pnpm")) {
+			return "pnpm install"
+		}
+	case prog == "npm" || prog == "npm.cmd" || prog == "npx" || prog == "npx.cmd":
+		if !fileExists(filepath.Join(dir, "node_modules", ".package-lock.json")) &&
+			!fileExists(filepath.Join(dir, "node_modules", ".yarn-integrity")) {
+			return "npm install"
+		}
+	case prog == "yarn" || prog == "yarn.cmd":
+		if !fileExists(filepath.Join(dir, "node_modules", ".yarn-integrity")) {
+			return "yarn install"
+		}
+	case prog == "node" || prog == "node.exe":
+		if fileExists(filepath.Join(dir, "package-lock.json")) &&
+			!fileExists(filepath.Join(dir, "node_modules", ".package-lock.json")) {
+			return "npm install"
+		}
+		if fileExists(filepath.Join(dir, "pnpm-lock.yaml")) &&
+			!dirExists(filepath.Join(dir, "node_modules", ".pnpm")) {
+			return "pnpm install"
+		}
+	case prog == "pip" || prog == "pip3" || prog == "python" || prog == "python3":
+		req := filepath.Join(dir, "requirements.txt")
+		if fileExists(req) {
+			return "pip install -r requirements.txt"
+		}
+	}
+	return ""
 }
 
 // waitForService polls 127.0.0.1:port until it accepts connections, the

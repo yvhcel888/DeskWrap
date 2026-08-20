@@ -103,9 +103,19 @@ func main() {
 		return // second instance - signal delivered, nothing to do
 	}
 
-	if err := startService(cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "[DeskWrap]", err)
-		os.Exit(1)
+	// Delay service start when dependencies are missing — the service
+	// window will show an install page and start the service after deps
+	// are ready (createServiceWindow handles this).
+	cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
+	cwd := cfgStr(cfg, "service.cwd")
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if needsDepsInstall(cwd, cmdArr) == "" {
+		if err := startService(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "[DeskWrap]", err)
+			os.Exit(1)
+		}
 	}
 
 	createServiceWindow(cfg)

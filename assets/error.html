@@ -12,7 +12,7 @@
       display: flex; align-items: center; justify-content: center;
       height: 100vh;
     }
-    .card { text-align: center; max-width: 480px; padding: 40px; }
+    .card { text-align: center; max-width: 520px; padding: 40px; }
     .logo {
       width: 72px; height: 72px; margin: 0 auto 24px; border-radius: 16px;
       background: linear-gradient(135deg, #4f8cff, #7c5cff);
@@ -26,6 +26,7 @@
       color: #8fd3ff; font-size: 13px;
     }
     .status { margin-top: 20px; font-size: 13px; color: #f5b04a; min-height: 18px; }
+    .status.ok { color: #6fd38c; }
     .btn {
       margin-top: 24px; padding: 10px 28px; border: none; border-radius: 8px;
       background: #4f8cff; color: #fff; font-size: 14px; cursor: pointer;
@@ -38,6 +39,13 @@
       border-radius: 50%; animation: spin 0.9s linear infinite;
     }
     .spinner.hidden { display: none; }
+    .deps-box {
+      text-align: left; margin-top: 18px; padding: 12px 14px;
+      background: #171b22; border: 1px solid #262c36; border-radius: 8px;
+      font-size: 12.5px; color: #c9d1db; line-height: 1.8;
+      max-height: 180px; overflow: auto; display: none;
+    }
+    .deps-box.show { display: block; }
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
@@ -45,23 +53,59 @@
   <div class="card">
     <div class="logo">D</div>
     <h1 id="title">正在启动服务…</h1>
-    <p>正在等待本地服务就绪</p>
+    <p id="sub">正在等待本地服务就绪</p>
     <p>地址：<code id="url">…</code></p>
     <div class="spinner" id="spinner"></div>
     <div class="status" id="status"></div>
+    <div class="deps-box" id="depsBox"></div>
+    <button class="btn hidden" id="installBtn">📦 安装依赖</button>
     <button class="btn hidden" id="retry">重试</button>
   </div>
   <script>
     // window.__DW_INIT__ is injected by the Go side before this page loads:
-    // { url, appName, error?: "timeout" }
+    // { url, appName, error?: "timeout", depsCmd?: "pnpm install" }
     var init = window.__DW_INIT__ || {};
     var url = init.url || '';
     var appName = init.appName || 'DeskWrap';
     var failed = init.error === 'timeout';
+    var depsCmd = init.depsCmd || '';
+    var installBtn = document.getElementById('installBtn');
+    var depsBox = document.getElementById('depsBox');
 
     document.title = appName;
     document.getElementById('url').textContent = url;
 
+    // ---------- deps missing state ----------
+    if (depsCmd) {
+      document.getElementById('title').textContent = '需要安装依赖';
+      document.getElementById('sub').textContent = '首次运行：请先安装项目依赖。';
+      document.getElementById('spinner').classList.add('hidden');
+      document.getElementById('status').textContent = '安装命令：' + depsCmd;
+      depsBox.classList.add('show');
+      depsBox.textContent = '';
+      installBtn.classList.remove('hidden');
+      installBtn.onclick = async function () {
+        installBtn.disabled = true;
+        installBtn.textContent = '⏳ 安装中…';
+        depsBox.textContent = '';
+        document.getElementById('status').textContent = '';
+        // __dw_installDeps is bound by the Go side.
+        var res = await window.deskwrap.installDeps();
+        if (res && res.ok) {
+          document.getElementById('title').textContent = '✅ 依赖安装完成';
+          document.getElementById('sub').textContent = '正在启动服务…';
+          document.getElementById('spinner').classList.remove('hidden');
+          installBtn.classList.add('hidden');
+        } else {
+          document.getElementById('title').textContent = '安装失败';
+          document.getElementById('status').textContent = (res && res.error) || '安装命令执行失败，请手动安装。';
+          installBtn.disabled = false;
+          installBtn.textContent = '📦 重试安装';
+        }
+      };
+    }
+
+    // ---------- timeout state ----------
     if (failed) {
       document.getElementById('title').textContent = '服务启动超时';
       document.getElementById('status').textContent = '请检查服务日志，或点击重试。';
