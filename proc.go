@@ -231,15 +231,18 @@ func needsDepsInstall(dir string, command []string) string {
 	return ""
 }
 
-// waitForService polls 127.0.0.1:port until it accepts connections, the
+// waitForService polls localhost:port until it accepts connections, the
 // deadline passes, or the service process dies (exitCh closed).
+// Uses "localhost" instead of "127.0.0.1" so Vite 8+ (which defaults to
+// IPv6 localhost ::1) is detected correctly.
 func waitForService(port int, timeout time.Duration, exitCh <-chan struct{}) bool {
 	if port <= 0 {
 		return true // no port configured - assume ready after spawn
 	}
 	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("localhost:%d", port)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			return true
@@ -258,7 +261,7 @@ func portListening(port int) bool {
 	if port <= 0 {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 1500*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 500*time.Millisecond)
 	if err != nil {
 		return false
 	}

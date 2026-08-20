@@ -305,7 +305,7 @@ func createServiceWindow(cfg map[string]any) {
 		serviceWin = w
 		winMu.Unlock()
 
-		url := fmt.Sprintf("http://127.0.0.1:%d", cfgInt(cfg, "service.port"))
+		url := fmt.Sprintf("http://localhost:%d", cfgInt(cfg, "service.port"))
 		initParams := map[string]any{
 			"url":     url,
 			"appName": cfgStr(cfg, "appName"),
@@ -463,7 +463,7 @@ func runInstallDeps(w webview2.WebView, cfg map[string]any, cwd, installCmd stri
 	}
 
 	// Navigate to the service.
-	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+	url := fmt.Sprintf("http://localhost:%d", port)
 	w.Dispatch(func() { w.Navigate(url) })
 	return map[string]any{"ok": true}
 }
@@ -481,7 +481,7 @@ func guiRetry(cfg map[string]any) map[string]any {
 	}
 	ok := waitForService(port, timeout, currentServiceExitCh())
 	if ok && serviceWin != nil {
-		url := fmt.Sprintf("http://127.0.0.1:%d", port)
+		url := fmt.Sprintf("http://localhost:%d", port)
 		w := serviceWin
 		w.Dispatch(func() { w.Navigate(url) })
 	}
