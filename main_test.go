@@ -190,3 +190,66 @@ func TestSanitizeName(t *testing.T) {
 		t.Fatalf("sanitize left invalid chars: %q", got)
 	}
 }
+
+// --- portable command rewriting ----------------------------------------------
+
+func writePkg(t *testing.T, dir, name string, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// "pnpm dsh web" → script "dsh" = "node --import tsx/esm apps/cli/src/bin.ts"
+func TestRewriteCommandForPortableScriptWithArgs(t *testing.T) {
+	dir := t.TempDir()
+	writePkg(t, dir, "package.json", `{"scripts":{"dsh":"node --import tsx/esm apps/cli/src/bin.ts"}}`)
+	got, ok := rewriteCommandForPortable([]string{"pnpm", "dsh", "web"}, dir).([]string)
+	if !ok {
+		t.Fatalf("rewrite did not return []string: %v", rewriteCommandForPortable([]string{"pnpm", "dsh", "web"}, dir))
+	}
+	want := []string{"node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web"}
+	if len(got) != len(want) {
+		t.Fatalf("rewrite = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rewrite = %v, want %v", got, want)
+		}
+	}
+}
+
+// "pnpm run dev" with vite: resolves the real JS entry from node_modules.
+func TestRewriteCommandForPortableVite(t *testing.T) {
+	dir := t.TempDir()
+	writePkg(t, dir, "package.json", `{"scripts":{"dev":"vite"}}`)
+	writePkg(t, dir, "node_modules/vite/package.json", `{"bin":{"vite":"bin/vite.js"}}`)
+	writePkg(t, dir, "node_modules/vite/bin/vite.js", "// vite")
+	got, ok := rewriteCommandForPortable([]string{"pnpm", "run", "dev"}, dir).([]string)
+	if !ok {
+		t.Fatalf("rewrite did not return []string")
+	}
+	want := []string{"node", filepath.Join("node_modules", "vite", "bin", "vite.js")}
+	if len(got) != len(want) || got[0] != want[0] || filepath.ToSlash(got[1]) != filepath.ToSlash(want[1]) {
+		t.Fatalf("rewrite = %v, want %v", got, want)
+	}
+}
+
+// A script that is already runtime-first must pass through untouched.
+func TestRewriteCommandForPortableDirectNode(t *testing.T) {
+	dir := t.TempDir()
+	writePkg(t, dir, "package.json", `{"scripts":{"start":"node server.js"}}`)
+	got, ok := rewriteCommandForPortable([]string{"node", "server.js"}, dir).([]string)
+	if !ok {
+		t.Fatalf("rewrite did not return []string")
+	}
+	want := []string{"node", "server.js"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("rewrite = %v, want %v", got, want)
+	}
+}

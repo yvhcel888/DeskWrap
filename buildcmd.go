@@ -192,8 +192,9 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 
 // rewriteCommandForPortable rewrites the service command to use the bundled
 // node.exe directly instead of requiring pnpm/npm on the target machine.
-// For ["pnpm","run","dev"], it reads the "dev" script from package.json and
-// returns ["node","node_modules/.bin/vite"] (or equivalent).
+// Handles "pnpm run dev", "pnpm dev", "pnpm dsh web" (script + extra args),
+// and scripts whose body starts with node/python or a bin tool like tsx:
+//   ["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web"]
 func rewriteCommandForPortable(cmd any, appDir string) any {
 	parts, _ := resolveCommand(cmd)
 	if len(parts) < 2 {
@@ -201,33 +202,23 @@ func rewriteCommandForPortable(cmd any, appDir string) any {
 	}
 	prog := strings.ToLower(filepath.Base(parts[0]))
 	switch prog {
-	case "node", "node.exe":
-		return cmd // already uses node directly
+	case "node", "node.exe", "python", "python.exe", "python3":
+		return cmd // uses the runtime directly — startService points at the bundled one
 	case "pnpm", "pnpm.cmd", "npm", "npm.cmd", "yarn", "yarn.cmd":
-		scriptName := parts[len(parts)-1]
-		if len(parts) >= 3 && parts[1] == "run" {
-			scriptName = parts[2]
+		var scriptName string
+		var restArgs []string
+		if parts[1] == "run" && len(parts) >= 3 {
+			scriptName, restArgs = parts[2], parts[3:]
+		} else if len(parts) >= 2 {
+			scriptName, restArgs = parts[1], parts[2:]
 		}
 		pkgPath := filepath.Join(appDir, "package.json")
 		if pkg, err := readRawConfig(pkgPath); err == nil {
 			if scripts, ok := pkg["scripts"].(map[string]any); ok {
 				if actual, ok := scripts[scriptName].(string); ok && actual != "" {
-					binary := strings.Fields(actual)[0]
-					// Find the real JS entry point from node_modules/<binary>/package.json
-					// (the .bin/ scripts are shell/batch wrappers that don't work with node).
-					binPkg := filepath.Join(appDir, "node_modules", binary, "package.json")
-					if bpkg, err2 := readRawConfig(binPkg); err2 == nil {
-						if binMap, ok := bpkg["bin"].(map[string]any); ok {
-							if entry, ok := binMap[binary].(string); ok {
-								fullEntry := filepath.Join(appDir, "node_modules", binary, entry)
-								if fileExists(fullEntry) {
-									return []string{"node", filepath.Join("node_modules", binary, entry)}
-								}
-							}
-						}
+					if rw := rewriteScriptForPortable(actual, restArgs, appDir); rw != nil {
+						return rw
 					}
-					// Fallback: node -e with the script content (for code-like scripts).
-					return []string{"node", "-e", actual}
 				}
 			}
 		}
@@ -235,6 +226,73 @@ func rewriteCommandForPortable(cmd any, appDir string) any {
 	default:
 		return cmd
 	}
+}
+
+// rewriteScriptForPortable turns a package.json script body into a command
+// that runs on the bundled runtime: node/python stay as-is (plus args), bin
+// tools (tsx, vite, ...) are resolved to their real JS entry so "node <entry>"
+// works without any shim. Returns nil if it cannot rewrite.
+func rewriteScriptForPortable(actual string, restArgs []string, appDir string) []string {
+	fields := strings.Fields(actual)
+	if len(fields) == 0 {
+		return nil
+	}
+	binary := strings.ToLower(fields[0])
+	var entry string
+	switch binary {
+	case "node", "node.exe", "python", "python3", "python.exe":
+		// Runtime-first script (e.g. "node --import tsx/esm apps/cli/src/bin.ts").
+		out := append([]string{binary}, fields[1:]...)
+		return append(out, restArgs...)
+	default:
+		entry = binEntry(appDir, fields[0])
+		if entry == "" {
+			// Common fallbacks for well-known tools.
+			switch binary {
+			case "tsx":
+				entry = "node_modules/tsx/dist/cli.mjs"
+			case "vite":
+				entry = "node_modules/vite/bin/vite.js"
+			case "vitest":
+				entry = "node_modules/vitest/vitest.mjs"
+			}
+			if entry != "" && fileExists(filepath.Join(appDir, entry)) {
+				out := append([]string{"node", entry}, fields[1:]...)
+				return append(out, restArgs...)
+			}
+			return nil
+		}
+	}
+	out := append([]string{"node", entry}, fields[1:]...)
+	return append(out, restArgs...)
+}
+
+// binEntry resolves the real JS entry of a bin tool installed in
+// node_modules/<binary>/ (the .bin/ scripts are shell/batch wrappers that
+// don't work with node).
+func binEntry(appDir, binary string) string {
+	binPkg := filepath.Join(appDir, "node_modules", binary, "package.json")
+	bpkg, err := readRawConfig(binPkg)
+	if err != nil {
+		return ""
+	}
+	entry := ""
+	if binMap, ok := bpkg["bin"].(map[string]any); ok {
+		entry, _ = binMap[binary].(string)
+	}
+	if entry == "" {
+		if s, ok := bpkg["bin"].(string); ok {
+			entry = s
+		}
+	}
+	if entry == "" {
+		return ""
+	}
+	full := filepath.Join(appDir, "node_modules", binary, entry)
+	if !fileExists(full) {
+		return ""
+	}
+	return filepath.Join("node_modules", binary, entry)
 }
 
 // copyProjectDir copies the source tree to dst, skipping buildExclude entries
@@ -268,6 +326,22 @@ func copyProjectDir(src, dst string, skipDirs ...string) error {
 			}
 		}
 		dstPath := filepath.Join(dst, rel)
+		// Junction / symlink (pnpm links node_modules entries to the .pnpm
+		// store or workspace dirs with Windows junctions): expand the target
+		// content. Opening a junction like a file fails with
+		// ERROR_INVALID_FUNCTION ("Incorrect function"), and a junction's
+		// absolute target would be broken on the recipient's machine anyway,
+		// so links are always expanded.
+		if info.Mode()&os.ModeSymlink != 0 || isJunctionDir(path) {
+			st, err := os.Stat(path)
+			if err != nil {
+				return nil // broken link — skip
+			}
+			if st.IsDir() {
+				return copyExpanded(path, dstPath, nil, 0)
+			}
+			return copyFile(path, dstPath) // file symlink — os.Open follows it
+		}
 		if info.IsDir() {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
@@ -424,14 +498,102 @@ func copyDirTreeExclude(src, dst string, exclude map[string]bool) error {
 		if rel == "." {
 			return os.MkdirAll(dst, 0o755)
 		}
+		// Expand junctions/symlinks (see copyProjectDir for why).
+		if info.Mode()&os.ModeSymlink != 0 || isJunctionDir(path) {
+			st, err := os.Stat(path)
+			if err != nil {
+				return nil // broken link — skip
+			}
+			if st.IsDir() {
+				return copyExpanded(path, filepath.Join(dst, rel), exclude, 0)
+			}
+			return copyFile(path, filepath.Join(dst, rel))
+		}
 		if info.IsDir() {
-			if exclude[filepath.Base(rel)] {
+			if exclude != nil && exclude[filepath.Base(rel)] {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(filepath.Join(dst, rel), info.Mode())
 		}
 		return copyFile(path, filepath.Join(dst, rel))
 	})
+}
+
+// isJunctionDir reports whether path is a Windows junction (or directory
+// symlink). Go's Lstat reports a junction as a plain file with an unknown
+// mode ("?rw-rw-rw-"), while Stat follows it and sees a directory — that
+// mismatch is the reliable detection.
+func isJunctionDir(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.IsDir() {
+		return false // normal dir or missing — handled elsewhere
+	}
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+
+// copyExpanded copies the content of a link target (symlink or Windows
+// junction) into dst, recursing into nested links. It is used instead of
+// plain copyFile because a directory junction cannot be read like a file.
+//
+// depth guards against circular junction chains (pnpm stores A↔B circular
+// deps as junctions that alternate forever): the require cache resolves such
+// cycles within 2–3 levels at runtime, so anything beyond maxLinkDepth is
+// unreachable duplicate content and safe to drop. 12 = 6 full cycles, ample
+// headroom while keeping the duplicated volume bounded.
+const maxLinkDepth = 12
+
+func copyExpanded(path, dst string, exclude map[string]bool, depth int) error {
+	if depth > maxLinkDepth {
+		return nil // circular junction chain — deep duplicates are unreachable
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return copyFile(path, dst) // file link — copy the file itself
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		src := filepath.Join(path, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		fi, err := os.Lstat(src)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			if exclude != nil && exclude[e.Name()] {
+				continue
+			}
+			if err := copyExpanded(src, dstPath, exclude, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || isJunctionDir(src) {
+			st, err := os.Stat(src)
+			if err != nil {
+				continue
+			}
+			if st.IsDir() {
+				if exclude != nil && exclude[e.Name()] {
+					continue
+				}
+				if err := copyExpanded(src, dstPath, exclude, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := copyFile(src, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyFile(src, dstPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -486,6 +648,12 @@ func zipDir(zipPath, base string) error {
 			return nil // skip the zip itself and directory entries (implied)
 		}
 		rel, _ := filepath.Rel(base, path)
-		return add(path, filepath.ToSlash(rel))
+		name := filepath.ToSlash(rel)
+		// Skip unreachable deep circular-duplicate entries (expanded junction
+		// chains) — most extractors fail on paths beyond 260 chars.
+		if len(name) > 250 {
+			return nil
+		}
+		return add(path, name)
 	})
 }
