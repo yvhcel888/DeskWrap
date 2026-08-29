@@ -12,6 +12,7 @@
 - **轻量产物**：打包体积只有源码 + 依赖（无 Electron 250MB 冗余）；纯工具本体 zip 仅 ~3.6MB
 - **零工具链**：单 exe 即出包，无需 Rust/Cargo/Node
 - **自动检测**：Vite/Next.js/Flask/FastAPI/Gradio/Streamlit/Go/pnpm workspace 的启动命令与端口
+- **pnpm monorepo 支持**：`pnpm dsh web` 这类命令自动改写为 bundled Node 直启真实入口；junction/循环依赖安全展开，超大仓库也能打包
 - **进程树治理**：关窗即清服务进程树（taskkill /T /F），cmd shim 直启防黑窗
 - **去密打包**：产物不包含你的 deskwrap.config.json（可能含 API Key）、.env、代理与 AI 配置；zip 内运行时完整（exe + 配置 + app/ + node/ 或 python/），解压即用
 - **AI 日志诊断**：粘贴报错日志，AI 给出修复建议（24 家提供商，需自备 API Key）
