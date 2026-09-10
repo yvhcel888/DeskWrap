@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -188,6 +189,58 @@ func TestSanitizeName(t *testing.T) {
 	}
 	if got := sanitizeName("My App 1.0"); strings.ContainsAny(got, `<>:"/\|?*`) {
 		t.Fatalf("sanitize left invalid chars: %q", got)
+	}
+}
+
+// --- ring log concurrency ----------------------------------------------------
+
+// push is called from the stdout and stderr pump goroutines at the same time;
+// it must hold the mutex so concurrent push/tail/reset cannot corrupt lines.
+func TestRingLogConcurrentPush(t *testing.T) {
+	var r ringLog
+	var wg sync.WaitGroup
+	for _, chunk := range []string{"alpha\nbeta\n", "gamma\n"} {
+		wg.Add(1)
+		go func(c string) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				r.push(c)
+			}
+		}(chunk)
+	}
+	for i := 0; i < 50; i++ {
+		_ = r.tail(10)
+	}
+	wg.Wait()
+	lines := r.tail(maxLogLines * 2)
+	if len(lines) > maxLogLines {
+		t.Fatalf("ring log grew beyond cap: %d", len(lines))
+	}
+	for _, l := range lines {
+		if l != "alpha" && l != "beta" && l != "gamma" {
+			t.Fatalf("corrupted line: %q", l)
+		}
+	}
+}
+
+// --- streamlit detection uses the real entry file -----------------------------
+
+func TestDetectStreamlitAppPy(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "streamlit_app.py"),
+		[]byte("import streamlit as st\nst.write('hi')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := detect(dir)
+	if d["type"] != "python" || d["command"] != "streamlit" {
+		t.Fatalf("detect = %v, want python/streamlit", d)
+	}
+	args := stringSlice(d["args"])
+	if len(args) != 2 || args[0] != "run" || args[1] != "streamlit_app.py" {
+		t.Fatalf("args = %v, want [run streamlit_app.py]", args)
+	}
+	if d["port"] != 8501 {
+		t.Fatalf("port = %v, want 8501", d["port"])
 	}
 }
 

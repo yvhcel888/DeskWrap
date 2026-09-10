@@ -188,7 +188,7 @@ func watchServiceExit(c *exec.Cmd, gen int, cfg map[string]any) {
 
 	if !quitting.Load() && cfgBool(cfg, "autoRestart") {
 		fmt.Printf("[DeskWrap] %s\n", t("autoRestarting"))
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond) // keep in sync with the t("autoRestarting") text
 		if !quitting.Load() {
 			_ = startService(cfg)
 		}

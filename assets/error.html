@@ -129,8 +129,9 @@
       btn.onclick = async function () {
         btn.disabled = true;
         document.getElementById('status').textContent = '正在重启服务…';
-        var ok = await window.deskwrap.retry();
-        if (!ok) {
+        // deskwrap.retry() resolves to an object { ok: boolean }.
+        var res = await window.deskwrap.retry();
+        if (!res || !res.ok) {
           document.getElementById('status').textContent = '服务仍然无法启动，请检查配置。';
           btn.disabled = false;
         }

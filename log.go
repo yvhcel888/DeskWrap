@@ -17,6 +17,11 @@ type ringLog struct {
 
 func (r *ringLog) push(s string) {
 	s = strings.ReplaceAll(s, "\r", "")
+	// push is called from the stdout and stderr pump goroutines concurrently
+	// (and from GUI-triggered actions), while tail/reset read under the same
+	// mutex — without this lock the slice append below is a data race.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, line := range strings.Split(s, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue

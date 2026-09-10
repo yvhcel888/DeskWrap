@@ -106,19 +106,27 @@ var (
 
 // acquireSingleInstance returns false when another DeskWrap instance is
 // already running (and signals it to show its window).
+//
+// CreateMutexW returns a VALID handle to the existing mutex when the name is
+// already taken (last error = ERROR_ALREADY_EXISTS) — checking only h == 0
+// misses that case and lets every launch start a new instance. The last
+// error must be checked regardless of the handle value.
 func acquireSingleInstance() bool {
 	name, _ := syscall.UTF16PtrFromString("DeskWrap_SingleInstance_v2")
 	h, _, err := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(name)))
-	if h == 0 {
-		if errno, ok := err.(syscall.Errno); ok && errno == 183 /*ERROR_ALREADY_EXISTS*/ {
-			evName, _ := syscall.UTF16PtrFromString("DeskWrap_Show_v2")
-			ev, _, _ := procOpenEventW.Call(0x000F0000|0x00100000 /*EVENT_ALL_ACCESS*/, 0, uintptr(unsafe.Pointer(evName)))
-			if ev != 0 {
-				procSetEvent.Call(ev)
-				procCloseHandle.Call(ev)
-			}
-			return false
+	if errno, ok := err.(syscall.Errno); ok && errno == 183 /*ERROR_ALREADY_EXISTS*/ {
+		if h != 0 {
+			procCloseHandle.Call(h) // duplicate handle to the existing mutex
 		}
+		evName, _ := syscall.UTF16PtrFromString("DeskWrap_Show_v2")
+		ev, _, _ := procOpenEventW.Call(0x000F0000|0x00100000 /*EVENT_ALL_ACCESS*/, 0, uintptr(unsafe.Pointer(evName)))
+		if ev != 0 {
+			procSetEvent.Call(ev)
+			procCloseHandle.Call(ev)
+		}
+		return false
+	}
+	if h == 0 {
 		return true // lock failed for another reason - don't block startup
 	}
 	singleInstanceMutex = h
@@ -126,9 +134,15 @@ func acquireSingleInstance() bool {
 	evName, _ := syscall.UTF16PtrFromString("DeskWrap_Show_v2")
 	ev, _, _ := procCreateEventW.Call(0, 1, 0, uintptr(unsafe.Pointer(evName)))
 	singleInstanceEvent = ev
+	if ev == 0 {
+		return true // event creation failed - single instance still held, just no show signal
+	}
 	go func() {
 		for {
-			procWaitForSingleObject.Call(singleInstanceEvent, 0xFFFFFFFF)
+			r, _, _ := procWaitForSingleObject.Call(singleInstanceEvent, 0xFFFFFFFF)
+			if r != 0 /*WAIT_OBJECT_0*/ {
+				return // event broken - stop the loop instead of spinning
+			}
 			showSignalCh <- struct{}{}
 		}
 	}()
@@ -422,17 +436,19 @@ func runInstallDeps(w webview2.WebView, cfg map[string]any, cwd, installCmd stri
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 
-	// Stream output to the depsBox div.
+	// Stream output to the depsBox div. The text is spliced into a JS string
+	// literal, so it must be escaped as one: JSON encoding is a valid JS
+	// string literal and handles quotes, backslashes and the \r\n line
+	// endings that npm/pnpm emit on Windows (a raw \r or ' would break the
+	// Eval call with a syntax error and the log would silently stop).
 	streamOutput := func(r io.ReadCloser) {
 		buf := make([]byte, 512)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
-				text := strings.ReplaceAll(string(buf[:n]), "\\", "\\\\")
-				text = strings.ReplaceAll(text, "`", "'")
-				text = strings.ReplaceAll(text, "\n", "\\n")
+				text := jsonString(string(buf[:n]))
 				w.Dispatch(func() {
-					w.Eval("document.getElementById('depsBox').textContent += '" + text + "'")
+					w.Eval("var b=document.getElementById('depsBox');if(b){b.textContent += " + text + ";b.scrollTop=b.scrollHeight;}")
 				})
 			}
 			if err != nil {
@@ -482,9 +498,11 @@ func guiRetry(cfg map[string]any) map[string]any {
 		timeout = 60 * time.Second
 	}
 	ok := waitForService(port, timeout, currentServiceExitCh())
-	if ok && serviceWin != nil {
+	winMu.Lock()
+	w := serviceWin
+	winMu.Unlock()
+	if ok && w != nil {
 		url := fmt.Sprintf("http://localhost:%d", port)
-		w := serviceWin
 		w.Dispatch(func() { w.Navigate(url) })
 	}
 	return map[string]any{"ok": ok}

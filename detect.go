@@ -169,20 +169,23 @@ func detect(dir string) map[string]any {
 			}
 			return false
 		}
-		pyStreamlit := false
+		pyStreamlit := ""
 		for _, f := range files {
 			if strings.HasPrefix(f, "streamlit") && strings.HasSuffix(f, ".py") {
-				pyStreamlit = true
+				pyStreamlit = f
 				break
 			}
 		}
 		switch {
-		case hasPy("streamlit_app.py") || pyStreamlit:
+		case pyStreamlit != "":
+			// Run the file that actually exists — hardcoding "app.py" fails
+			// on projects whose entry is streamlit_app.py / streamlit_*.py.
+			// (streamlit_app.py itself matches the prefix scan above.)
 			result["type"] = "python"
 			result["command"] = "streamlit"
-			result["args"] = []string{"run", "app.py"}
+			result["args"] = []string{"run", pyStreamlit}
 			result["port"] = 8501
-			hints("streamlit app detected")
+			hints("streamlit app detected (" + pyStreamlit + ")")
 		case hasPy("manage.py"):
 			result["type"] = "python"
 			result["command"] = "python"
