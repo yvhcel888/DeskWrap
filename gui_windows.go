@@ -441,12 +441,20 @@ func runInstallDeps(w webview2.WebView, cfg map[string]any, cwd, installCmd stri
 	// string literal and handles quotes, backslashes and the \r\n line
 	// endings that npm/pnpm emit on Windows (a raw \r or ' would break the
 	// Eval call with a syntax error and the log would silently stop).
+	//
+	// The 512-byte reads also split multi-byte characters: json.Marshal
+	// replaces every invalid UTF-8 byte with U+FFFD, so one Chinese character
+	// straddling a chunk boundary was rendered as two replacement chars.
+	// streamToLog decodes through decodeChunk for exactly this reason — hold
+	// back the partial trailing character and land it with the next chunk.
+	// The state must be per-stream: stdout and stderr are pumped concurrently.
 	streamOutput := func(r io.ReadCloser) {
 		buf := make([]byte, 512)
+		var dec decodeChunk
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
-				text := jsonString(string(buf[:n]))
+				text := jsonString(dec.decode(buf[:n]))
 				w.Dispatch(func() {
 					w.Eval("var b=document.getElementById('depsBox');if(b){b.textContent += " + text + ";b.scrollTop=b.scrollHeight;}")
 				})

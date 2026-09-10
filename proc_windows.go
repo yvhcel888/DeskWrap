@@ -308,6 +308,20 @@ func systemANSIEncoding() encoding.Encoding {
 	return enc
 }
 
+// utf8ExpectedLen returns the total length of the UTF-8 sequence a lead byte
+// starts (2, 3 or 4), or 1 when the byte cannot start one.
+func utf8ExpectedLen(lead byte) int {
+	switch {
+	case lead >= 0xC2 && lead <= 0xDF:
+		return 2
+	case lead >= 0xE0 && lead <= 0xEF:
+		return 3
+	case lead >= 0xF0 && lead <= 0xF4:
+		return 4
+	}
+	return 1
+}
+
 // decodeChunk decodes a byte chunk as UTF-8; if invalid, it holds back a
 // possible partial trailing character and falls back to the ANSI codepage.
 type decodeChunk struct {
@@ -315,6 +329,7 @@ type decodeChunk struct {
 }
 
 func (d *decodeChunk) decode(b []byte) string {
+	hadPending := len(d.pending) > 0
 	b = append(d.pending, b...)
 	d.pending = nil
 
@@ -322,11 +337,26 @@ func (d *decodeChunk) decode(b []byte) string {
 		return string(b)
 	}
 	// Maybe a multibyte character got split across reads: hold back the tail.
-	for n := 1; n <= 3 && n < len(b); n++ {
+	hold := 0
+	for n := 1; n <= 4 && n < len(b); n++ {
 		if utf8.Valid(b[:len(b)-n]) {
-			d.pending = append([]byte{}, b[len(b)-n:]...)
-			return string(b[:len(b)-n])
+			hold = n
+			break
 		}
+	}
+	// A tail carried over from the previous read resumes as a continuation
+	// byte and so can't re-validate on its own — "已安装" split mid-character
+	// used to come back as U+FFFD. If the head of the buffer is an incomplete
+	// sequence, hold back exactly that sequence, keep the pending bytes, and
+	// wait for the next read to complete it.
+	if hold == 0 && hadPending {
+		if n := incompleteSeqLen(b); n > 0 && n < len(b) {
+			hold = n
+		}
+	}
+	if hold > 0 {
+		d.pending = append([]byte{}, b[len(b)-hold:]...)
+		return string(b[:len(b)-hold])
 	}
 	// Genuinely not UTF-8 (e.g. GBK console output): use the ANSI codepage.
 	if enc := systemANSIEncoding(); enc != nil {
@@ -335,6 +365,26 @@ func (d *decodeChunk) decode(b []byte) string {
 		}
 	}
 	return string(b)
+}
+
+// incompleteSeqLen returns the length of a UTF-8 sequence truncated at the
+// START of b, or 0 when b starts with complete text.
+func incompleteSeqLen(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
+	want := utf8ExpectedLen(b[0])
+	if want == 1 {
+		return 0
+	}
+	n := 1
+	for n < len(b) && n < want && b[n]&0xC0 == 0x80 {
+		n++
+	}
+	if n == want {
+		return 0 // the sequence does fit inside this chunk
+	}
+	return n
 }
 
 // streamToLog pipes child output into a ring log (decoded) and echoes it to

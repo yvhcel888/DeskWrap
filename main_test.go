@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -241,6 +242,74 @@ func TestDetectStreamlitAppPy(t *testing.T) {
 	}
 	if d["port"] != 8501 {
 		t.Fatalf("port = %v, want 8501", d["port"])
+	}
+}
+
+// --- deps-install log chunks --------------------------------------------------
+
+// runInstallDeps reads the install command's output in 512-byte chunks and
+// splices each one into a JS string literal. Two independent requirements:
+// the fragment must be escaped as a JS *and* JSON string literal (npm/pnpm
+// emit \r\n, quotes and backslashes), and a multi-byte character split
+// across a chunk boundary must not be mangled into U+FFFD.
+func TestDepsLogChunkEscaping(t *testing.T) {
+	// pnpm 进度条 style: carriage returns, backslashes, single quotes.
+	raw := "added 12 packages\r\nC:\\Users\\tzj\\.pnpm\\store\r\ndone 'install' `x`"
+	enc := jsonString(raw)
+	if !strings.HasPrefix(enc, `"`) || !strings.HasSuffix(enc, `"`) {
+		t.Fatalf("not a JS string literal: %s", enc)
+	}
+	if strings.ContainsAny(enc[1:len(enc)-1], "\r\n") {
+		t.Fatalf("raw CR/LF survived into the Eval source: %q", enc)
+	}
+	if !strings.Contains(enc, `\r\n`) {
+		t.Fatalf("CR/LF must be escaped as \\r\\n, got %q", enc)
+	}
+	if !strings.Contains(enc, `\\Users`) {
+		t.Fatalf("backslashes must stay escaped, got %q", enc)
+	}
+	// encode → decode must round-trip: the depsBox must show what npm printed.
+	var back string
+	if err := json.Unmarshal([]byte(enc), &back); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+	if back != raw {
+		t.Fatalf("round-trip = %q, want %q", back, raw)
+	}
+}
+
+// A multi-byte character split across a read boundary must survive. The
+// realistic shape is "ASCII text, then a 3-byte character cut in half" —
+// npm/pnpm output line by line, streamed 512 bytes at a time. Reassembling
+// the per-chunk jsonString fragments must spell out the whole text; a raw
+// jsonString per half-chunk mangles it into U+FFFD.
+func TestDepsLogChunkSplitUtf8(t *testing.T) {
+	raw := []byte("已安装 3 个包")
+	cut := len("已安装 3 ") + 1 // split 个 (3 bytes at [12..14]) after its first byte
+
+	var d decodeChunk
+	gotA, gotB := d.decode(raw[:cut]), d.decode(raw[cut:])
+	if joined := gotA + gotB; joined != string(raw) {
+		t.Fatalf("split decode = %q, want %q", joined, string(raw))
+	}
+
+	// This is the whole point: each 512-byte read becomes its own jsonString
+	// payload appended to the depsBox. Each payload is a complete JS string
+	// literal, so strip the outer quotes from both and the fragments must
+	// spell out the whole escaped text.
+	unquote := func(s string) string { return strings.Trim(s, `"`) }
+	split := unquote(jsonString(gotA)) + unquote(jsonString(gotB))
+	want := unquote(jsonString(string(raw)))
+	if split != want {
+		t.Fatalf("split chunks encoded to %q, want %q", split, want)
+	}
+	if strings.Contains(split, `\ufffd`) {
+		t.Fatalf("replacement characters leaked into the log payload: %q", split)
+	}
+
+	// Regression guard: without decodeChunk the first fragment is mojibake.
+	if unguarded := jsonString(string(raw[:cut])); !strings.Contains(unguarded, `\ufffd`) {
+		t.Fatalf("expected the raw half-chunk to mangle to U+FFFD, got %s", unguarded)
 	}
 }
 

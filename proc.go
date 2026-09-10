@@ -188,10 +188,37 @@ func watchServiceExit(c *exec.Cmd, gen int, cfg map[string]any) {
 
 	if !quitting.Load() && cfgBool(cfg, "autoRestart") {
 		fmt.Printf("[DeskWrap] %s\n", t("autoRestarting"))
-		time.Sleep(1500 * time.Millisecond) // keep in sync with the t("autoRestarting") text
-		if !quitting.Load() {
+		// Only restart, never revive: the wait must stay cancellable. A plain
+		// sleep here used to let the user's "retry"/"run" (which bump
+		// serviceGen) land inside the window and then this watcher started a
+		// SECOND service on top of the one they had just launched.
+		if autoRestartWait(gen) {
 			_ = startService(cfg)
 		}
+	}
+}
+
+// autoRestartWait pauses between an unexpected exit and the auto-restart.
+// It returns false as soon as the decision is stale — the user stopped or
+// restarted the service themselves (serviceGen moved on) or the app is
+// quitting — so a manual action always wins and no duplicate service is
+// spawned. 1500ms is also what t("autoRestarting") promises the user.
+func autoRestartWait(gen int) bool {
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for {
+		if quitting.Load() {
+			return false
+		}
+		serviceMu.Lock()
+		stale := serviceGen != gen
+		serviceMu.Unlock()
+		if stale {
+			return false
+		}
+		if !time.Now().Before(deadline) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

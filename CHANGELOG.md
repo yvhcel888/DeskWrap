@@ -18,6 +18,17 @@ All notable changes to DeskWrap are documented here. The format is based on [Kee
 - **Vite 8+ 端口探测失败**：Vite 8 默认监听 IPv6 `::1`，用 `127.0.0.1` 探测永远不通。改用 `localhost` 双栈探测
 - **打包时 GUI 卡死**：`build` 同步阻塞 WebView2 主线程（拷贝大依赖时界面冻结数分钟）。改为 goroutine 异步执行 + 完成回调
 
+### Fixed / 修复（第二轮）
+
+- **无法单实例（严重）**：`CreateMutexW` 在互斥体已存在时返回的是**有效句柄**（仅 `last error = ERROR_ALREADY_EXISTS`），旧代码只在 `h == 0` 时判断该错误，于是每次双击都会新开一个实例。现在无论句柄值如何都先判 last error，并关闭重复句柄
+- **Streamlit 入口写死 `app.py`**：入口为 `streamlit_app.py` / `streamlit_*.py` 的项目启动即失败。现在运行实际存在的入口文件
+- **日志环形缓冲区数据竞争**：`ringLog.push` 由 stdout/stderr 两个 goroutine 并发调用，却未加锁（`tail`/`reset` 已加锁）。补上锁，并新增并发回归测试
+- **重试按钮永远判定失败**：`window.deskwrap.retry()` 返回的是 `{ok: boolean}` 对象，`error.html` 按布尔值判断，导致服务其实重启成功也提示"仍然无法启动"
+- **依赖安装日志乱码（中文/多字节）**：安装输出按 512 字节切片后直接 `json.Marshal`，跨切片的 UTF-8 字符被替换为 U+FFFD。现在与 `streamToLog` 一致地经 `decodeChunk` 解码（新增 `incompleteSeqLen`，修复了跨读片段以续接字节开头时被误判为 ANSI 而乱码的老问题）
+- **依赖安装日志吞字符**：旧转义只处理 `\` `` ` `` `\n`，npm/pnpm 在 Windows 输出的 `\r` 与单引号会让 `Eval` 抛语法错误、日志静默中断。现在按 JS/JSON 字符串字面量转义，并自动滚动到底部
+- **自动重启与服务重试竞态（重复进程）**：服务异常退出后有 1.5 秒等待窗口，用户在此窗口点"重试/运行"会启动新服务，随后旧退出监视器**再启动一个**。现在等待期间持续校验 `serviceGen`，用户操作立即取消自动重启
+- **单实例事件等待空转**：`WaitForSingleObject` 返回值未检查，事件损坏时会 100% CPU 忙循环
+
 ### Added / 新增
 
 - **便携 Python 捆绑**：Python 项目（Gradio/Flask/FastAPI/Streamlit 等）打包时自动创建 venv 并 `pip install -r requirements.txt`，产物内置可移植 Python（自动清理 `__pycache__`），对方无需装 Python、不再看到 "pip install" 提示
