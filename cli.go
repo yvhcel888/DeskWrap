@@ -109,12 +109,62 @@ func argValue(argv []string, name string) string {
 	return ""
 }
 
+type cliCommandArgs struct {
+	dir        string
+	configPath string
+	rest       []string
+}
+
+// parseCliCommandArgs removes --config from the positional arguments and
+// validates its value. --out is also skipped when finding the project dir so
+// its value cannot be mistaken for that dir.
+func parseCliCommandArgs(argv []string) (cliCommandArgs, error) {
+	parsed := cliCommandArgs{}
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case a == "--config":
+			if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "-") {
+				return cliCommandArgs{}, fmt.Errorf("--config requires a file path")
+			}
+			i++
+			parsed.configPath = normalizeArg(argv[i])
+			if parsed.configPath == "" {
+				return cliCommandArgs{}, fmt.Errorf("--config requires a file path")
+			}
+		case strings.HasPrefix(a, "--config="):
+			parsed.configPath = normalizeArg(strings.TrimPrefix(a, "--config="))
+			if parsed.configPath == "" {
+				return cliCommandArgs{}, fmt.Errorf("--config requires a file path")
+			}
+		case a == "--out":
+			parsed.rest = append(parsed.rest, a)
+			if i+1 < len(argv) {
+				i++
+				parsed.rest = append(parsed.rest, argv[i])
+			}
+		default:
+			parsed.rest = append(parsed.rest, a)
+			if parsed.dir == "" && !strings.HasPrefix(a, "-") {
+				parsed.dir = normalizeArg(a)
+			}
+		}
+	}
+	return parsed, nil
+}
+
 // cliInit interactively generates a config file.
 func cliInit(argv []string) int {
 	dir := normalizeArg(firstNonFlag(argv))
 	if dir == "" {
 		dir, _ = os.Getwd()
 	}
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[deskwrap] Cannot resolve project directory %s: %v\n", dir, err)
+		return 1
+	}
+	dir = absoluteDir
 	force := hasArg(argv, "--force")
 	target := filepath.Join(dir, "deskwrap.config.json")
 	if fileExists(target) && !force {
@@ -192,9 +242,23 @@ func floatOr(v any, def float64) float64 {
 }
 
 func cliDetect(argv []string) int {
-	dir := normalizeArg(firstNonFlag(argv))
+	parsed, err := parseCliCommandArgs(argv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[deskwrap] %v\n", err)
+		return 1
+	}
+	dir := parsed.dir
 	if dir == "" {
-		dir, _ = os.Getwd()
+		dir = mustCwd()
+	}
+	if parsed.configPath != "" {
+		cfg, path, code := resolveCliConfig(dir, parsed.configPath)
+		if code != 0 {
+			return code
+		}
+		if parsed.dir == "" {
+			dir = resolveServiceCwdFrom(cfg, path)
+		}
 	}
 	d := detect(dir)
 	fmt.Printf("Project: %s\n", fmt.Sprint(d["dir"]))
@@ -222,28 +286,42 @@ func cliDetect(argv []string) int {
 	return 0
 }
 
-func resolveCliConfig(dir string) (map[string]any, string, int) {
+// resolveCliConfig loads an explicitly selected config when supplied. Without
+// one it retains the CLI search order: environment, project, current directory.
+// The optional argument keeps existing callers source-compatible.
+func resolveCliConfig(dir string, selectedPath ...string) (map[string]any, string, int) {
+	explicit := len(selectedPath) > 0 && selectedPath[0] != ""
 	candidates := []string{}
-	if p := os.Getenv("DESKWRAP_CONFIG"); p != "" {
-		candidates = append(candidates, p)
-	}
-	candidates = append(candidates,
-		filepath.Join(dir, "deskwrap.config.json"),
-		filepath.Join(mustCwd(), "deskwrap.config.json"))
-	for _, c := range candidates {
-		if fileExists(c) {
-			raw, err := readRawConfig(c)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[deskwrap] Invalid config %s: %v\n", c, err)
-				return nil, "", 1
-			}
-			cmd := pickPath(raw, "service.command")
-			if !hasServiceCommand(cmd) {
-				fmt.Fprintf(os.Stderr, "[deskwrap] Invalid config %s: service.command is empty\n", c)
-				return nil, "", 1
-			}
-			return deepMerge(defaults, raw), c, 0
+	if explicit {
+		path, err := filepath.Abs(normalizeArg(selectedPath[0]))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[deskwrap] Invalid config %s: %v\n", selectedPath[0], err)
+			return nil, "", 1
 		}
+		candidates = append(candidates, path)
+	} else {
+		if p := os.Getenv("DESKWRAP_CONFIG"); p != "" {
+			candidates = append(candidates, p)
+		}
+		candidates = append(candidates,
+			filepath.Join(dir, "deskwrap.config.json"),
+			filepath.Join(mustCwd(), "deskwrap.config.json"))
+	}
+	for _, c := range candidates {
+		if !explicit && !fileExists(c) {
+			continue
+		}
+		raw, err := readRawConfig(c)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[deskwrap] Invalid config %s: %v\n", c, err)
+			return nil, "", 1
+		}
+		cmd := pickPath(raw, "service.command")
+		if !hasServiceCommand(cmd) {
+			fmt.Fprintf(os.Stderr, "[deskwrap] Invalid config %s: service.command is empty\n", c)
+			return nil, "", 1
+		}
+		return deepMerge(defaults, raw), c, 0
 	}
 	fmt.Fprintln(os.Stderr, `[deskwrap] No deskwrap.config.json found. Run "deskwrap init" first.`)
 	return nil, "", 1
@@ -258,17 +336,22 @@ func mustCwd() string {
 }
 
 func cliRunApp(argv []string) int {
-	dir := normalizeArg(firstNonFlag(argv))
+	parsed, err := parseCliCommandArgs(argv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[deskwrap] %v\n", err)
+		return 1
+	}
+	dir := parsed.dir
 	if dir == "" {
 		dir = mustCwd()
 	}
-	cfg, path, code := resolveCliConfig(dir)
+	cfg, path, code := resolveCliConfig(dir, parsed.configPath)
 	if code != 0 {
 		return code
 	}
 
 	cmdArr, _ := resolveCommand(pickPath(cfg, "service.command"))
-	_, warnings := checkServiceEnvironment(cmdArr, cfgStr(cfg, "service.cwd"))
+	_, warnings := checkServiceEnvironment(cmdArr, resolveServiceCwdFrom(cfg, path))
 	for _, w := range warnings {
 		fmt.Fprintf(os.Stderr, "[deskwrap] ⚠ %s\n", w)
 	}
@@ -283,15 +366,23 @@ func cliGui(argv []string) int {
 }
 
 func cliBuild(argv []string) int {
-	dir := normalizeArg(firstNonFlag(argv))
+	parsed, err := parseCliCommandArgs(argv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[deskwrap] %v\n", err)
+		return 1
+	}
+	dir := parsed.dir
 	if dir == "" {
 		dir = mustCwd()
 	}
-	cfg, _, code := resolveCliConfig(dir)
+	cfg, path, code := resolveCliConfig(dir, parsed.configPath)
 	if code != 0 {
 		return code
 	}
-	if out := argValue(argv, "--out"); out != "" {
+	if parsed.dir == "" && cfgStr(cfg, "service.cwd") != "" {
+		dir = resolveServiceCwdFrom(cfg, path)
+	}
+	if out := argValue(parsed.rest, "--out"); out != "" {
 		cfg["outDir"] = out
 	}
 	fmt.Printf("[deskwrap] Packaging %s ...\n", cfgStr(cfg, "appName"))

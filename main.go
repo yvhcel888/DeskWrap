@@ -16,8 +16,6 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
-
-	"golang.org/x/sys/windows"
 )
 
 var (
@@ -37,23 +35,13 @@ func hasFlag(name string) bool {
 
 var devFlag = hasFlag("--dev")
 
-// enableUTF8Console switches a real Windows console to UTF-8 (CP 65001) so
-// the bilingual output renders correctly under chcp 936/437. Piped or
-// redirected output is left untouched (pure UTF-8 bytes).
-func enableUTF8Console() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
-	if err != nil {
-		return
-	}
-	var mode uint32
-	if windows.GetConsoleMode(h, &mode) != nil {
-		return // not a console
-	}
-	_ = windows.SetConsoleOutputCP(65001)
-	_ = windows.SetConsoleCP(65001)
+var (
+	appDone     = make(chan struct{})
+	appDoneOnce sync.Once
+)
+
+func windowsDone() {
+	appDoneOnce.Do(func() { close(appDone) })
 }
 
 func runtimeOS() string {
@@ -119,7 +107,7 @@ func main() {
 
 	createServiceWindow(cfg)
 	<-appDone
-	stopService()
+	shutdownService()
 }
 
 // runGuiMode opens the management GUI (7-panel sidebar) and blocks until it
@@ -129,8 +117,7 @@ func runGuiMode() {
 		return
 	}
 	createGuiWindow()
-	quitting.Store(true)
-	stopService()
+	shutdownService()
 }
 
 // runWait runs a command with inherited stdio and returns its exit code.

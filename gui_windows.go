@@ -7,7 +7,10 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,22 +44,19 @@ var (
 	serviceWin webview2.WebView
 	winMu      sync.Mutex
 
-	appDone     = make(chan struct{})
-	appDoneOnce sync.Once
+	serviceWinGen      uint64
+	serviceWinStarting bool
 
 	showSignalCh = make(chan struct{}, 8)
 
 	closeToTray atomic.Bool
 	trayQuit    atomic.Bool
+	trayRunning atomic.Bool
 
 	// subclassing for close-to-tray
 	subclassedHWND uintptr
 	origWndProc    uintptr
 )
-
-func windowsDone() {
-	appDoneOnce.Do(func() { close(appDone) })
-}
 
 // --- platform init: console hiding + single instance ------------------------
 
@@ -197,6 +197,19 @@ func webview2RuntimeAvailable() bool {
 	return pf != "" && fileExists(filepath.Join(pf, "Microsoft", "Edge", "Application", "msedge.exe"))
 }
 
+// validateWebviewDownload rejects HTTP error pages and truncated responses
+// before any downloaded bytes can be executed. A Windows executable must at
+// least contain a complete DOS header beginning with the MZ signature.
+func validateWebviewDownload(status int, data []byte) error {
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("HTTP %d", status)
+	}
+	if len(data) < 64 || data[0] != 'M' || data[1] != 'Z' {
+		return fmt.Errorf("响应不是有效的 Windows 可执行文件（missing MZ signature）")
+	}
+	return nil
+}
+
 // offerWebviewInstall downloads the official Evergreen bootstrapper and
 // installs the runtime silently when the user agrees.
 func offerWebviewInstall() bool {
@@ -208,26 +221,41 @@ func offerWebviewInstall() bool {
 		openExternal("https://developer.microsoft.com/microsoft-edge/webview2/")
 		return false
 	}
-	tmp := filepath.Join(os.TempDir(), "deskwrap-wv2setup.exe")
-	data, _, err := appFetch("GET", "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+	data, status, err := appFetch("GET", "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
 		map[string]string{}, nil, 5*time.Minute)
+	if err == nil {
+		err = validateWebviewDownload(status, data)
+	}
 	if err != nil {
 		msgBox(0, "下载失败: "+err.Error(), "DeskWrap", 0x10)
 		return false
 	}
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+	tmp, err := os.CreateTemp(os.TempDir(), "deskwrap-wv2setup-*.exe")
+	if err != nil {
+		msgBox(0, "创建临时文件失败: "+err.Error(), "DeskWrap", 0x10)
+		return false
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		msgBox(0, "写入临时文件失败: "+err.Error(), "DeskWrap", 0x10)
 		return false
 	}
-	defer os.Remove(tmp)
-	c := exec.Command(tmp, "/silent", "/install")
+	if err := tmp.Close(); err != nil {
+		msgBox(0, "关闭临时文件失败: "+err.Error(), "DeskWrap", 0x10)
+		return false
+	}
+	c := exec.Command(tmpPath, "/silent", "/install")
 	applyHiddenFlags(c)
 	done := make(chan struct{})
 	go func() { _ = c.Run(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Minute):
-		killProcessTree(c.Process.Pid)
+		if c.Process != nil {
+			killProcessTree(c.Process.Pid)
+		}
 	}
 	return webview2RuntimeAvailable()
 }
@@ -281,7 +309,7 @@ func newWebviewWindow(cfg map[string]any) (webview2.WebView, error) {
 	dataPath := filepath.Join(exeDir, "deskwrap-webview-data")
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
-		Debug:     devFlag,
+		Debug:     devFlag || cfgBool(cfg, "showDevTools"),
 		DataPath:  dataPath,
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
@@ -305,27 +333,74 @@ func newWebviewWindow(cfg map[string]any) (webview2.WebView, error) {
 
 // --- service window (wraps the user's web service) ---------------------------
 
+func newServiceToken() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf)
+}
+
+func validServiceToken(got, want string) bool {
+	if got == "" || want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
 func createServiceWindow(cfg map[string]any) {
+	winMu.Lock()
+	if serviceWinStarting || serviceWin != nil {
+		winMu.Unlock()
+		return
+	}
+	serviceWinStarting = true
+	serviceWinGen++
+	gen := serviceWinGen
+	winMu.Unlock()
 	go func() {
 		w, err := newWebviewWindow(cfg)
 		if err != nil {
 			msgBox(0, err.Error(), "DeskWrap", 0x10)
-			stopService()
+			winMu.Lock()
+			if serviceWinGen == gen {
+				serviceWinStarting = false
+			}
+			winMu.Unlock()
+			shutdownService()
 			windowsDone()
 			return
 		}
 		winMu.Lock()
+		if serviceWinGen != gen {
+			winMu.Unlock()
+			w.Destroy()
+			return
+		}
 		serviceWin = w
+		serviceWinStarting = false
 		winMu.Unlock()
 
+		serviceToken := newServiceToken()
+		if serviceToken == "" {
+			w.Destroy()
+			shutdownService()
+			windowsDone()
+			return
+		}
 		url := fmt.Sprintf("http://localhost:%d", cfgInt(cfg, "service.port"))
 		initParams := map[string]any{
 			"url":     url,
 			"appName": cfgStr(cfg, "appName"),
 		}
 		w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
-		_ = w.Bind("__dw_retry", func() map[string]any { return guiRetry(cfg) })
-		w.Init(`(function(){ window.deskwrap = window.deskwrap || {}; window.deskwrap.retry = function(){ return __dw_retry(); }; })();`)
+		_ = w.Bind("__dw_retry", func(token string) map[string]any {
+			if !validServiceToken(token, serviceToken) {
+				return map[string]any{"ok": false, "error": "invalid service request"}
+			}
+			return guiRetry(cfg)
+		})
+		errorPage := strings.Replace(errorHTML, "__DW_SERVICE_TOKEN__", serviceToken, 1)
 
 		// Check if the runtime (Node/Python) or dependencies are missing.
 		cwd := resolveServiceCwd(cfg)
@@ -337,20 +412,22 @@ func createServiceWindow(cfg map[string]any) {
 			// Runtime missing: show guidance page with install link.
 			initParams["rtMissing"] = rtMissing
 			w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
-			w.SetHtml(errorHTML)
+			w.SetHtml(errorPage)
 		} else if installCmd != "" {
 			// Deps missing: show install page, keep message pump running.
 			// runInstallDeps will start the service after installing.
 			initParams["depsCmd"] = installCmd
 			w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(initParams)))
-			_ = w.Bind("__dw_installDeps", func() map[string]any {
+			_ = w.Bind("__dw_installDeps", func(token string) map[string]any {
+				if !validServiceToken(token, serviceToken) {
+					return map[string]any{"ok": false, "error": "invalid service request"}
+				}
 				return runInstallDeps(w, cfg, cwd, installCmd)
 			})
-			w.Init(`(function(){ window.deskwrap.installDeps = function(){ return __dw_installDeps(); }; })();`)
-			w.SetHtml(errorHTML)
+			w.SetHtml(errorPage)
 		} else {
 			// Normal: show waiting page, start service poll.
-			w.SetHtml(errorHTML)
+			w.SetHtml(errorPage)
 			go func() {
 				timeout := time.Duration(cfgInt(cfg, "service.readyTimeout")) * time.Millisecond
 				if timeout <= 0 {
@@ -358,12 +435,18 @@ func createServiceWindow(cfg map[string]any) {
 				}
 				ok := waitForService(cfgInt(cfg, "service.port"), timeout, currentServiceExitCh())
 				w.Dispatch(func() {
+					winMu.Lock()
+					current := serviceWinGen == gen && serviceWin == w
+					winMu.Unlock()
+					if !current {
+						return
+					}
 					if ok {
 						w.Navigate(url)
 					} else {
 						params := map[string]any{"url": url, "appName": cfgStr(cfg, "appName"), "error": "timeout"}
 						w.Init(fmt.Sprintf("window.__DW_INIT__ = %s;", jsonString(params)))
-						w.SetHtml(errorHTML)
+						w.SetHtml(errorPage)
 					}
 				})
 			}()
@@ -377,23 +460,49 @@ func createServiceWindow(cfg map[string]any) {
 		}
 
 		// Second instance / tray click -> show.
+		windowDone := make(chan struct{})
 		go func() {
-			for range showSignalCh {
-				showWindow(w)
+			for {
+				select {
+				case <-showSignalCh:
+					showWindow(w)
+				case <-windowDone:
+					return
+				}
 			}
 		}()
 
 		w.Run()
+		close(windowDone)
 
-		closeToTray.Store(false)
 		winMu.Lock()
-		serviceWin = nil
+		current := serviceWinGen == gen && serviceWin == w
+		if current {
+			serviceWin = nil
+			serviceWinStarting = false
+			closeToTray.Store(false)
+		}
+		guiOpen := guiWin != nil
 		winMu.Unlock()
-		if guiWin == nil {
-			stopService()
+		if current && !guiOpen {
+			shutdownService()
 			windowsDone()
 		}
 	}()
+}
+
+func replaceServiceWindow(cfg map[string]any) {
+	winMu.Lock()
+	old := serviceWin
+	serviceWin = nil
+	serviceWinStarting = false
+	serviceWinGen++
+	winMu.Unlock()
+	closeToTray.Store(false)
+	if old != nil {
+		old.Destroy()
+	}
+	createServiceWindow(cfg)
 }
 
 // ensureServiceWindow opens (or re-shows) the service window; used by the
@@ -519,8 +628,14 @@ func guiRetry(cfg map[string]any) map[string]any {
 // --- tray --------------------------------------------------------------------
 
 func startTray(appName string) {
+	if !trayRunning.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
-		defer func() { _ = recover() }()
+		defer func() {
+			trayRunning.Store(false)
+			_ = recover()
+		}()
 		systray.Run(func() {
 			systray.SetIcon(trayIcon)
 			systray.SetTitle(appName)
@@ -534,9 +649,16 @@ func startTray(appName string) {
 						showSignalCh <- struct{}{}
 					case <-mQuit.ClickedCh:
 						trayQuit.Store(true)
+						shutdownService()
 						winMu.Lock()
-						w := serviceWin
+						sw := serviceWin
+						serviceWin = nil
+						w := guiWin
+						guiWin = nil
 						winMu.Unlock()
+						if sw != nil {
+							sw.Destroy()
+						}
 						if w != nil {
 							w.Destroy()
 						}
@@ -610,7 +732,7 @@ func createGuiWindow() {
 	if sw != nil {
 		sw.Destroy()
 	}
-	stopService()
+	shutdownService()
 	windowsDone()
 }
 
@@ -623,6 +745,7 @@ func openExternal(urlStr string) {
 const jsDeskWrapObject = `(function(){
   var deskwrap = window.deskwrap || {};
   deskwrap.getInfo = __dw_getInfo;
+  deskwrap.getConfig = __dw_getConfig;
   deskwrap.pickFolder = __dw_pickFolder;
   deskwrap.resolveProject = __dw_resolveProject;
   deskwrap.detect = __dw_detect;
@@ -652,21 +775,18 @@ const jsDeskWrapObject = `(function(){
 func bindGuiAPI(w webview2.WebView) {
 	fns := map[string]any{
 		"__dw_getInfo":        func() map[string]any { return guiGetInfo() },
+		"__dw_getConfig":      func(dir string) map[string]any { return guiReadConfig(dir) },
 		"__dw_pickFolder":     func() string { return pickFolderDialog("") },
 		"__dw_resolveProject": func(a string) map[string]any { return resolveProjectInput(a) },
 		"__dw_detect":         func(dir string) map[string]any { return detect(dir) },
-		"__dw_saveConfig": func(dir string, cfg map[string]any) string {
-			target := filepath.Join(dir, "deskwrap.config.json")
-			_ = writeRawConfig(target, cfg)
-			return target
-		},
-		"__dw_runApp":     func(dir string, cfg map[string]any) map[string]any { return guiRunApp(dir, cfg) },
-		"__dw_buildApp":   func(dir string, cfg map[string]any) map[string]any { return guiBuildApp(dir, cfg) },
-		"__dw_getLog":     func() []string { return guiGetLog() },
-		"__dw_aiDiagnose": func(opts map[string]any) map[string]any { return aiDiagnose(opts) },
-		"__dw_checkEnv":      func() map[string]any { return checkEnvironment() },
-		"__dw_envExtended":   func() map[string]any { return guiEnvExtended() },
-		"__dw_detectEngines": func(dir string) map[string]any { return guiDetectEngines(dir) },
+		"__dw_saveConfig":     func(dir string, cfg map[string]any) map[string]any { return guiSaveConfig(dir, cfg) },
+		"__dw_runApp":         func(dir string, cfg map[string]any) map[string]any { return guiRunApp(dir, cfg) },
+		"__dw_buildApp":       func(dir string, cfg map[string]any) map[string]any { return guiBuildApp(dir, cfg) },
+		"__dw_getLog":         func() []string { return guiGetLog() },
+		"__dw_aiDiagnose":     func(opts map[string]any) map[string]any { return aiDiagnose(opts) },
+		"__dw_checkEnv":       func() map[string]any { return checkEnvironment() },
+		"__dw_envExtended":    func() map[string]any { return guiEnvExtended() },
+		"__dw_detectEngines":  func(dir string) map[string]any { return guiDetectEngines(dir) },
 		"__dw_openExternal": func(url string) map[string]any {
 			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
 				openExternal(url)
@@ -708,6 +828,38 @@ func guiGetInfo() map[string]any {
 	return map[string]any{"appName": appName, "port": port, "configPath": path, "config": raw}
 }
 
+// guiReadConfig returns the raw config for a selected project so the GUI can
+// preserve fields that are not represented by form controls.
+func guiReadConfig(dir string) map[string]any {
+	if strings.TrimSpace(dir) == "" {
+		return map[string]any{"ok": false, "error": "尚未选择项目目录"}
+	}
+	target := filepath.Join(dir, "deskwrap.config.json")
+	raw, err := readRawConfig(target)
+	if os.IsNotExist(err) {
+		return map[string]any{"ok": true, "config": nil}
+	}
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	return map[string]any{"ok": true, "config": raw}
+}
+
+func guiSaveConfig(dir string, cfg map[string]any) map[string]any {
+	if strings.TrimSpace(dir) == "" {
+		return map[string]any{"ok": false, "error": "尚未选择项目目录"}
+	}
+	target := filepath.Join(dir, "deskwrap.config.json")
+	if err := writeRawConfig(target, cfg); err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	cfgMu.Lock()
+	config = deepMerge(defaults, cfg)
+	configPath = target
+	cfgMu.Unlock()
+	return map[string]any{"ok": true, "path": target}
+}
+
 func guiRunApp(dir string, cfg map[string]any) map[string]any {
 	target := filepath.Join(dir, "deskwrap.config.json")
 	if err := writeRawConfig(target, cfg); err != nil {
@@ -745,7 +897,7 @@ func guiRunApp(dir string, cfg map[string]any) map[string]any {
 	if err := startService(cfg); err != nil {
 		return map[string]any{"ok": false, "error": "failed to start service: " + err.Error()}
 	}
-	ensureServiceWindow(cfg)
+	replaceServiceWindow(cfg)
 	return map[string]any{"ok": true}
 }
 
@@ -960,26 +1112,33 @@ func guiPlatformSetToken(id, token string) map[string]any {
 
 func guiSetLocale(locale string) map[string]any {
 	value := locale
-	if value != "en-US" && value != "zh-CN" {
-		value = "auto"
+	if value != "auto" && value != "en-US" && value != "zh-CN" {
+		return map[string]any{"ok": false, "error": "不支持的语言 / Unsupported locale"}
 	}
 	cfgMu.RLock()
 	path := configPath
 	cfgMu.RUnlock()
-	if path != "" {
-		current, err := readRawConfig(path)
-		if err == nil {
-			current["locale"] = value
-			if writeRawConfig(path, current) == nil {
-				cfgMu.Lock()
-				config = deepMerge(defaults, current)
-				cfgMu.Unlock()
-			}
+	if path == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return map[string]any{"ok": false, "error": err.Error()}
 		}
-	} else {
-		cfgMu.Lock()
-		config["locale"] = value
-		cfgMu.Unlock()
+		path = filepath.Join(filepath.Dir(exe), "deskwrap.config.json")
 	}
-	return map[string]any{"ok": true}
+	current, err := readRawConfig(path)
+	if err != nil && !os.IsNotExist(err) {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	if current == nil {
+		current = map[string]any{}
+	}
+	current["locale"] = value
+	if err := writeRawConfig(path, current); err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	cfgMu.Lock()
+	config = deepMerge(defaults, current)
+	configPath = path
+	cfgMu.Unlock()
+	return map[string]any{"ok": true, "locale": value}
 }

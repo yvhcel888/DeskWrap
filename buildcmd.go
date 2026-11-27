@@ -32,21 +32,40 @@ type buildResult struct {
 // ships with dependencies pre-installed so the recipient can double-click
 // and run without needing to install anything.
 var buildExclude = map[string]bool{
-	".git":                 true,
-	".DS_Store":            true,
-	"Thumbs.db":            true,
+	".git":                  true,
+	".DS_Store":             true,
+	"Thumbs.db":             true,
 	"deskwrap-webview-data": true,
-	"deskwrap.config.json": true,  // user config may contain API keys — only the portable config is shipped
-	"release":              true,
-	"dist":                 true,
-	"__pycache__":          true, // Python bytecode caches (project source only)
-	".next":                true,
-	".nuxt":                true,
-	".vs":                  true,
-	".idea":                true,
-	"build":                true,
-	"out":                  true,
-	".env":                 true,   // may contain secrets
+	"deskwrap.config.json":  true, // user config may contain API keys — only the portable config is shipped
+	"release":               true,
+	"dist":                  true,
+	"__pycache__":           true, // Python bytecode caches (project source only)
+	".next":                 true,
+	".nuxt":                 true,
+	".vs":                   true,
+	".idea":                 true,
+	"build":                 true,
+	"out":                   true,
+	".env":                  true, // may contain secrets
+}
+
+// Secret-bearing files are excluded even inside node_modules. Other
+// buildExclude entries are not applied there because dist/, build/, out/, and
+// release/ commonly contain actual dependency code.
+var buildSecretExclude = map[string]bool{
+	".npmrc":                     true,
+	".npmrc.local":               true,
+	".pypirc":                    true,
+	".netrc":                     true,
+	".git-credentials":           true,
+	"deskwrap.config.json":       true,
+	"deskwrap.config.local.json": true,
+	"deskwrap.local.json":        true,
+}
+
+func isBuildSecretName(name string) bool {
+	name = strings.ToLower(filepath.Base(filepath.Clean(name)))
+	return name == ".env" || strings.HasPrefix(name, ".env.") || buildSecretExclude[name]
 }
 
 // sanitizeName produces a filesystem-safe artifact name.
@@ -87,24 +106,38 @@ func needsPythonRuntime(cfg map[string]any) bool {
 	return p == "python" || p == "python3" || p == "python.exe"
 }
 
+func pathContains(parent, child string) bool {
+	parentAbs, parentErr := filepath.Abs(parent)
+	childAbs, childErr := filepath.Abs(child)
+	if parentErr != nil || childErr != nil {
+		return false
+	}
+	rel, err := filepath.Rel(parentAbs, childAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
+}
+
 // doBuild packages the project at dir according to cfg.
 // Returns artifact paths (the .exe and the .zip) on success.
 func doBuild(dir string, cfg map[string]any) buildResult {
 	buildLog.reset()
 
-	// 1) Persist the config into the project.
-	target := filepath.Join(dir, "deskwrap.config.json")
-	if err := writeRawConfig(target, cfg); err != nil {
-		return buildResult{ok: false, err: "cannot write config: " + err.Error()}
-	}
-
-	// 2) Output directory.
+	// 1) Output directory.
 	outDir := cfgStr(cfg, "outDir")
 	if outDir == "" {
 		outDir = filepath.Join(dir, "release")
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return buildResult{ok: false, err: "cannot create output dir: " + err.Error()}
+	}
+	appDir := filepath.Join(outDir, "app")
+	resolvedAppDir := resolveCopyPath(appDir)
+	resolvedSource := resolveCopyPath(dir)
+	resolvedOutDir := resolveCopyPath(outDir)
+	if pathContains(resolvedOutDir, resolvedSource) || pathContains(resolvedAppDir, resolvedSource) {
+		return buildResult{ok: false, err: "output directory must not contain the source project"}
 	}
 
 	appName := cfgStr(cfg, "appName")
@@ -123,7 +156,7 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		return buildResult{ok: false, err: "cannot copy shell: " + err.Error()}
 	}
 
-	// 3) Sidecar DLL on Windows (WebView2 loader, 160KB).
+	// 2) Sidecar DLL on Windows (WebView2 loader, 160KB).
 	if runtime.GOOS == "windows" {
 		for _, cand := range []string{
 			filepath.Join(filepath.Dir(exeSrc), "WebView2Loader.dll"),
@@ -138,14 +171,16 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		}
 	}
 
-	// 4) Copy the project directory into outDir/app/ (including node_modules).
-	appDir := filepath.Join(outDir, "app")
+	// 3) Copy the project directory into outDir/app/ (including node_modules).
 	fmt.Printf("[DeskWrap] Copying project %s -> %s\n", dir, appDir)
+	if err := os.RemoveAll(appDir); err != nil {
+		return buildResult{ok: false, err: "cannot clean previous app directory: " + err.Error()}
+	}
 	if err := copyProjectDir(dir, appDir, outDir); err != nil {
 		return buildResult{ok: false, err: "cannot copy project: " + err.Error()}
 	}
 
-	// 5) Bundle portable runtimes — the recipient doesn't need them installed.
+	// 4) Bundle portable runtimes — the recipient doesn't need them installed.
 	if runtime.GOOS == "windows" {
 		if needsNodeRuntime(cfg) {
 			if err := bundleNodeRuntime(outDir); err != nil {
@@ -161,7 +196,7 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		}
 	}
 
-	// 6) Build a portable config: cwd relative, command rewritten for bundled node,
+	// 5) Build a portable config: cwd relative, command rewritten for bundled node,
 	//    and strip sensitive fields (API keys, proxy URLs, project-local paths).
 	portableCfg := deepMerge(map[string]any{}, cfg)
 	portableCfg["service"] = deepMerge(map[string]any{}, cfgMap(portableCfg, "service"))
@@ -180,7 +215,7 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 		return buildResult{ok: false, err: "cannot write portable config: " + err.Error()}
 	}
 
-	// 7) Zip: everything under outDir (exe + config + sidecars + app/ + node/ + python/).
+	// 6) Zip: everything under outDir (exe + config + sidecars + app/ + node/ + python/).
 	zipPath := filepath.Join(outDir, sanitizeName(appName)+"-win64.zip")
 	if err := zipDir(zipPath, outDir); err != nil {
 		return buildResult{ok: false, err: "cannot create zip: " + err.Error()}
@@ -194,7 +229,8 @@ func doBuild(dir string, cfg map[string]any) buildResult {
 // node.exe directly instead of requiring pnpm/npm on the target machine.
 // Handles "pnpm run dev", "pnpm dev", "pnpm dsh web" (script + extra args),
 // and scripts whose body starts with node/python or a bin tool like tsx:
-//   ["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web"]
+//
+//	["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web"]
 func rewriteCommandForPortable(cmd any, appDir string) any {
 	parts, _ := resolveCommand(cmd)
 	if len(parts) < 2 {
@@ -295,58 +331,35 @@ func binEntry(appDir, binary string) string {
 	return filepath.Join("node_modules", binary, entry)
 }
 
-// copyProjectDir copies the source tree to dst, skipping buildExclude entries
-// and the output directory itself (which may be inside the source tree).
+// copyProjectDir copies the source tree to dst, skipping secret files,
+// buildExclude entries outside node_modules, and the output directory itself
+// (which may be inside the source tree). Directory links are expanded with the
+// same rules rather than copied as unfiltered trees.
 func copyProjectDir(src, dst string, skipDirs ...string) error {
-	skip := map[string]bool{}
-	for _, d := range skipDirs {
-		skip[filepath.Clean(d)] = true
+	state, err := newCopyWalkState(skipDirs...)
+	if err != nil {
+		return err
 	}
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) { return nil } // skip missing dirs/files
-			return err
+	state.exclude = func(name, rel string, isDir bool) bool {
+		if isBuildSecretName(name) {
+			return true
 		}
-		rel, _ := filepath.Rel(src, path)
-		if rel == "." {
-			return os.MkdirAll(dst, 0o755)
+		if copyPathInNodeModules(rel) {
+			return false
 		}
-		if info.IsDir() && skip[filepath.Clean(path)] {
-			return filepath.SkipDir
+		return buildExclude[name]
+	}
+	state.secretName = isBuildSecretName
+	return state.copyDir(src, dst, ".", 0)
+}
+
+func copyPathInNodeModules(rel string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "node_modules" {
+			return true
 		}
-		name := filepath.Base(rel)
-		if buildExclude[name] {
-			// Never apply the exclude list inside node_modules — those
-			// directories (dist/, build/, etc.) contain actual package code.
-			if !strings.Contains(filepath.ToSlash(rel), "node_modules/") {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil // skip excluded files (deskwrap.config.json, .env, ...)
-			}
-		}
-		dstPath := filepath.Join(dst, rel)
-		// Junction / symlink (pnpm links node_modules entries to the .pnpm
-		// store or workspace dirs with Windows junctions): expand the target
-		// content. Opening a junction like a file fails with
-		// ERROR_INVALID_FUNCTION ("Incorrect function"), and a junction's
-		// absolute target would be broken on the recipient's machine anyway,
-		// so links are always expanded.
-		if info.Mode()&os.ModeSymlink != 0 || isJunctionDir(path) {
-			st, err := os.Stat(path)
-			if err != nil {
-				return nil // broken link — skip
-			}
-			if st.IsDir() {
-				return copyExpanded(path, dstPath, nil, 0)
-			}
-			return copyFile(path, dstPath) // file symlink — os.Open follows it
-		}
-		if info.IsDir() {
-			return os.MkdirAll(dstPath, info.Mode())
-		}
-		return copyFile(path, dstPath)
-	})
+	}
+	return false
 }
 
 // bundleNodeRuntime copies the system Node.js (node.exe + npm/) into
@@ -489,34 +502,13 @@ func copyDirTree(src, dst string) error {
 // copyDirTreeExclude copies src to dst recursively, skipping any directory
 // whose base name is in exclude.
 func copyDirTreeExclude(src, dst string, exclude map[string]bool) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) { return nil }
-			return err
+	state := &copyWalkState{activeDirs: map[string]bool{}}
+	if exclude != nil {
+		state.exclude = func(name, rel string, isDir bool) bool {
+			return isDir && exclude[name]
 		}
-		rel, _ := filepath.Rel(src, path)
-		if rel == "." {
-			return os.MkdirAll(dst, 0o755)
-		}
-		// Expand junctions/symlinks (see copyProjectDir for why).
-		if info.Mode()&os.ModeSymlink != 0 || isJunctionDir(path) {
-			st, err := os.Stat(path)
-			if err != nil {
-				return nil // broken link — skip
-			}
-			if st.IsDir() {
-				return copyExpanded(path, filepath.Join(dst, rel), exclude, 0)
-			}
-			return copyFile(path, filepath.Join(dst, rel))
-		}
-		if info.IsDir() {
-			if exclude != nil && exclude[filepath.Base(rel)] {
-				return filepath.SkipDir
-			}
-			return os.MkdirAll(filepath.Join(dst, rel), info.Mode())
-		}
-		return copyFile(path, filepath.Join(dst, rel))
-	})
+	}
+	return state.copyDir(src, dst, ".", 0)
 }
 
 // isJunctionDir reports whether path is a Windows junction (or directory
@@ -532,68 +524,207 @@ func isJunctionDir(path string) bool {
 	return err == nil && st.IsDir()
 }
 
+// copyWalkState gives ordinary and expanded directory copies one set of
+// exclusion, output-directory, and cycle rules.
+type copyWalkState struct {
+	exclude    func(name, rel string, isDir bool) bool
+	secretName func(name string) bool
+	skipDirs   map[string]bool
+	activeDirs map[string]bool
+}
+
+func newCopyWalkState(skipDirs ...string) (*copyWalkState, error) {
+	state := &copyWalkState{
+		skipDirs:   map[string]bool{},
+		activeDirs: map[string]bool{},
+	}
+	for _, dir := range skipDirs {
+		if dir == "" {
+			continue
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, err
+		}
+		abs = filepath.Clean(abs)
+		state.skipDirs[copyPathKey(abs)] = true
+		state.skipDirs[copyPathKey(resolveCopyPath(abs))] = true
+	}
+	return state, nil
+}
+
+func copyPathKey(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
+func resolveCopyPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	current := abs
+	var suffix []string
+	for depth := 0; depth <= maxLinkDepth*2; depth++ {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil && copyPathKey(resolved) != copyPathKey(current) {
+			current = resolved
+			continue
+		}
+		target, err := os.Readlink(current)
+		if err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(current), target)
+			}
+			current = filepath.Clean(target)
+			continue
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			if len(suffix) > 0 {
+				return filepath.Join(append([]string{current}, suffix...)...)
+			}
+			return current
+		}
+		suffix = append([]string{filepath.Base(current)}, suffix...)
+		current = parent
+	}
+	if len(suffix) > 0 {
+		return filepath.Join(append([]string{current}, suffix...)...)
+	}
+	return current
+}
+
+func copyDirIdentity(path string) (string, error) {
+	resolved := resolveCopyPath(path)
+	abs, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	return copyPathKey(abs), nil
+}
+
+// pathSkipped also checks ancestors so a link directly to a file under outDir
+// cannot bypass the directory skip.
+func (s *copyWalkState) pathSkipped(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	check := func(path string) bool {
+		for {
+			if s.skipDirs[copyPathKey(path)] {
+				return true
+			}
+			parent := filepath.Dir(path)
+			if parent == path {
+				return false
+			}
+			path = parent
+		}
+	}
+	if check(filepath.Clean(abs)) {
+		return true
+	}
+	return check(filepath.Clean(resolveCopyPath(abs)))
+}
+
+func (s *copyWalkState) copyDir(path, dst, rel string, depth int) error {
+	// The depth limit bounds acyclic link chains; activeDirs stops actual
+	// cycles immediately instead of duplicating them until the limit.
+	if depth > maxLinkDepth || s.pathSkipped(path) {
+		return nil
+	}
+	identity, err := copyDirIdentity(path)
+	if err != nil {
+		return err
+	}
+	if s.activeDirs[identity] {
+		return nil
+	}
+	s.activeDirs[identity] = true
+	defer delete(s.activeDirs, identity)
+
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		src := filepath.Join(path, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		childRel := filepath.Join(rel, entry.Name())
+		info, err := os.Lstat(src)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := s.copyEntry(src, dstPath, childRel, info, depth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *copyWalkState) copyEntry(src, dst, rel string, info os.FileInfo, depth int) error {
+	isLink := info.Mode()&os.ModeSymlink != 0 || isJunctionDir(src)
+	targetInfo := info
+	if isLink {
+		var err error
+		targetInfo, err = os.Stat(src)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil // broken link
+			}
+			return err
+		}
+		resolved := resolveCopyPath(src)
+		if s.pathSkipped(resolved) {
+			return nil
+		}
+		// An innocuous link name must not expose a credential file.
+		if s.secretName != nil && s.secretName(filepath.Base(resolved)) {
+			return nil
+		}
+	}
+	isDir := targetInfo.IsDir()
+	if s.exclude != nil && s.exclude(filepath.Base(src), rel, isDir) {
+		return nil
+	}
+	if isDir {
+		if isLink {
+			depth++
+		}
+		return s.copyDir(src, dst, rel, depth)
+	}
+	return copyFile(src, dst) // os.Open follows file links
+}
+
 // copyExpanded copies the content of a link target (symlink or Windows
 // junction) into dst, recursing into nested links. It is used instead of
 // plain copyFile because a directory junction cannot be read like a file.
 //
 // depth guards against circular junction chains (pnpm stores A↔B circular
-// deps as junctions that alternate forever): the require cache resolves such
-// cycles within 2–3 levels at runtime, so anything beyond maxLinkDepth is
-// unreachable duplicate content and safe to drop. 12 = 6 full cycles, ample
-// headroom while keeping the duplicated volume bounded.
+// deps as junctions that alternate forever). The active-directory set catches
+// cycles; the depth limit also bounds duplicated content in long acyclic
+// chains. 12 = 6 full cycles, ample headroom.
 const maxLinkDepth = 12
 
 func copyExpanded(path, dst string, exclude map[string]bool, depth int) error {
-	if depth > maxLinkDepth {
-		return nil // circular junction chain — deep duplicates are unreachable
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return copyFile(path, dst) // file link — copy the file itself
-	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
-	}
-	for _, e := range entries {
-		src := filepath.Join(path, e.Name())
-		dstPath := filepath.Join(dst, e.Name())
-		fi, err := os.Lstat(src)
-		if err != nil {
-			continue
-		}
-		if fi.IsDir() {
-			if exclude != nil && exclude[e.Name()] {
-				continue
-			}
-			if err := copyExpanded(src, dstPath, exclude, depth+1); err != nil {
-				return err
-			}
-			continue
-		}
-		if fi.Mode()&os.ModeSymlink != 0 || isJunctionDir(src) {
-			st, err := os.Stat(src)
-			if err != nil {
-				continue
-			}
-			if st.IsDir() {
-				if exclude != nil && exclude[e.Name()] {
-					continue
-				}
-				if err := copyExpanded(src, dstPath, exclude, depth+1); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := copyFile(src, dstPath); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := copyFile(src, dstPath); err != nil {
-			return err
+	state := &copyWalkState{activeDirs: map[string]bool{}}
+	if exclude != nil {
+		state.exclude = func(name, rel string, isDir bool) bool {
+			return isDir && exclude[name]
 		}
 	}
-	return nil
+	return state.copyDir(path, dst, ".", depth)
 }
 
 func copyFile(src, dst string) error {
@@ -616,14 +747,24 @@ func copyFile(src, dst string) error {
 // zipDir zips the whole output directory (exe, dlls, config, app/, node/,
 // python/) so the recipient can unzip and double-click with nothing
 // installed. The zip file itself is excluded.
-func zipDir(zipPath, base string) error {
+func zipDir(zipPath, base string) (err error) {
 	f, err := os.Create(zipPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 	zw := zip.NewWriter(f)
-	defer zw.Close()
+	zwClosed := false
+	defer func() {
+		if !zwClosed {
+			_ = zw.Close()
+		}
+	}()
 
 	add := func(path, name string) error {
 		in, err := os.Open(path)
@@ -639,13 +780,15 @@ func zipDir(zipPath, base string) error {
 		return err
 	}
 
-	return filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) { return nil }
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
-		if path == zipPath || info.IsDir() {
-			return nil // skip the zip itself and directory entries (implied)
+		if path == zipPath || info.IsDir() || (filepath.Dir(path) == base && strings.EqualFold(filepath.Ext(path), ".zip")) {
+			return nil
 		}
 		rel, _ := filepath.Rel(base, path)
 		name := filepath.ToSlash(rel)
@@ -656,4 +799,16 @@ func zipDir(zipPath, base string) error {
 		}
 		return add(path, name)
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	zwClosed = true
+	if err := f.Close(); err != nil {
+		return err
+	}
+	closed = true
+	return nil
 }

@@ -30,7 +30,7 @@ The missing last mile for AI-generated projects: the code exists, but installing
 
 ### GUI (double-click, no terminal)
 
-Download `DeskWrap-GUI-2.0.0-win-x64.zip` from [Releases](https://github.com/yvhcel888/DeskWrap/releases), extract, double-click **DeskWrap-GUI.exe**:
+Download `DeskWrap-GUI-2.0.2-win-x64.zip` from [Releases](https://github.com/yvhcel888/DeskWrap/releases), extract, double-click **DeskWrap-GUI.exe**:
 
 1. **项目 / Project** → pick a folder or paste a git URL
 2. Command & port are auto-filled → **▶ Run** opens the desktop window

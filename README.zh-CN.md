@@ -30,7 +30,7 @@ AI 生成的项目缺的"最后一公里"：代码有了，但装依赖、启动
 
 ### GUI 版（双击即用，无需命令行）
 
-从 [Releases](https://github.com/yvhcel888/DeskWrap/releases) 下载 `DeskWrap-GUI-2.0.0-win-x64.zip`，解压后双击 **DeskWrap-GUI.exe**：
+从 [Releases](https://github.com/yvhcel888/DeskWrap/releases) 下载 `DeskWrap-GUI-2.0.2-win-x64.zip`，解压后双击 **DeskWrap-GUI.exe**：
 
 1. **项目**面板 → 选择文件夹（或粘贴 git 仓库地址）
 2. 启动命令与端口自动回填 → 点 **▶ 运行** 打开桌面窗口

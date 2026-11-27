@@ -37,11 +37,12 @@ var defaults = map[string]any{
 }
 
 // deepMerge merges extra into base recursively (plain objects only, like the
-// original JS implementation).
+// original JS implementation). Nested values are copied so later edits to a
+// loaded config cannot mutate defaults or another loaded config.
 func deepMerge(base, extra map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range base {
-		out[k] = v
+		out[k] = cloneConfigValue(v)
 	}
 	for k, v := range extra {
 		if m, ok := v.(map[string]any); ok {
@@ -50,9 +51,26 @@ func deepMerge(base, extra map[string]any) map[string]any {
 				continue
 			}
 		}
-		out[k] = v
+		out[k] = cloneConfigValue(v)
 	}
 	return out
+}
+
+func cloneConfigValue(v any) any {
+	switch value := v.(type) {
+	case map[string]any:
+		return deepMerge(map[string]any{}, value)
+	case []any:
+		out := make([]any, len(value))
+		for i, item := range value {
+			out[i] = cloneConfigValue(item)
+		}
+		return out
+	case []string:
+		return append([]string{}, value...)
+	default:
+		return v
+	}
 }
 
 // findConfigPath resolves the config file:
@@ -118,7 +136,28 @@ func writeRawConfig(path string, m map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	closeWithError := func(err error) error {
+		if closeErr := f.Close(); err == nil {
+			return closeErr
+		}
+		return err
+	}
+	// OpenFile's mode only applies to new files. Tighten an existing file
+	// before truncating it because configs can contain API keys and tokens.
+	if err := f.Chmod(0o600); err != nil {
+		return closeWithError(err)
+	}
+	if err := f.Truncate(0); err != nil {
+		return closeWithError(err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return closeWithError(err)
+	}
+	return closeWithError(nil)
 }
 
 // --- typed accessors over dotted paths (e.g. "service.port") ----------------
@@ -192,20 +231,35 @@ func mustExecutable() string {
 	return p
 }
 
-// resolveServiceCwd resolves service.cwd to an absolute path.  Portable
-// builds use a relative cwd ("app") that must be resolved against the
-// executable's directory — the packaged app is double-clicked from
-// anywhere, so a cwd relative to the *launch* directory would be invalid.
+// resolveServiceCwd resolves service.cwd to an absolute path. A loaded config
+// provides the base for user-authored relative paths; without one, retain the
+// executable-relative behavior needed by portable builds.
 func resolveServiceCwd(cfg map[string]any) string {
+	return resolveServiceCwdFrom(cfg, configPath)
+}
+
+func resolveServiceCwdFrom(cfg map[string]any, path string) string {
 	cwd := cfgStr(cfg, "service.cwd")
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 		return cwd
 	}
-	if !filepath.IsAbs(cwd) {
-		cwd = filepath.Join(filepath.Dir(mustExecutable()), cwd)
+	if filepath.IsAbs(cwd) {
+		return filepath.Clean(cwd)
 	}
-	return filepath.Clean(cwd)
+
+	base := ""
+	if path != "" {
+		if absolute, err := filepath.Abs(path); err == nil {
+			base = filepath.Dir(absolute)
+		} else {
+			base = filepath.Dir(path)
+		}
+	}
+	if base == "" {
+		base = filepath.Dir(mustExecutable())
+	}
+	return filepath.Clean(filepath.Join(base, cwd))
 }
 
 func fileExists(p string) bool {

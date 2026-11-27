@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>DeskWrap</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -65,6 +66,7 @@
     // window.__DW_INIT__ is injected by the Go side before this page loads:
     // { url, appName, error?: "timeout", depsCmd?: "pnpm install", rtMissing?: "需要安装 Node.js: ..." }
     var init = window.__DW_INIT__ || {};
+    window.__DW_TOKEN__ = '__DW_SERVICE_TOKEN__';
     var url = init.url || '';
     var appName = init.appName || 'DeskWrap';
     var failed = init.error === 'timeout';
@@ -104,7 +106,7 @@
         depsBox.textContent = '';
         document.getElementById('status').textContent = '';
         // __dw_installDeps is bound by the Go side.
-        var res = await window.deskwrap.installDeps();
+        var res = await __dw_installDeps(window.__DW_TOKEN__);
         if (res && res.ok) {
           document.getElementById('title').textContent = '✅ 依赖安装完成';
           document.getElementById('sub').textContent = '正在启动服务…';
@@ -130,7 +132,7 @@
         btn.disabled = true;
         document.getElementById('status').textContent = '正在重启服务…';
         // deskwrap.retry() resolves to an object { ok: boolean }.
-        var res = await window.deskwrap.retry();
+        var res = await __dw_retry(window.__DW_TOKEN__);
         if (!res || !res.ok) {
           document.getElementById('status').textContent = '服务仍然无法启动，请检查配置。';
           btn.disabled = false;

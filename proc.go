@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -65,11 +66,63 @@ func hasServiceCommand(cmd any) bool {
 // mergedEnv = current process env + config.service.env (config wins).
 func mergedEnv(cfg map[string]any) []string {
 	env := os.Environ()
-	extra := cfgMap(cfg, "service.env")
-	for k, v := range extra {
-		env = append(env, k+"="+fmt.Sprint(v))
+	for k, v := range cfgMap(cfg, "service.env") {
+		env = setEnvValue(env, k, fmt.Sprint(v))
 	}
 	return env
+}
+
+func setEnvValue(env []string, key, value string) []string {
+	prefix := key + "="
+	out := env[:0]
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && ((runtime.GOOS == "windows" && strings.EqualFold(name, key)) || name == key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, prefix+value)
+}
+
+func prependBundledPath(env []string, exeDir string) []string {
+	var extra []string
+	for _, sub := range []string{"node", "python"} {
+		if dir := filepath.Join(exeDir, sub); dirExists(dir) {
+			extra = append(extra, dir)
+		}
+	}
+	if len(extra) == 0 {
+		return env
+	}
+	configured := ""
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && ((runtime.GOOS == "windows" && strings.EqualFold(name, "PATH")) || name == "PATH") {
+			configured = value
+			continue
+		}
+		out = append(out, entry)
+	}
+	parts := extra
+	if configured != "" {
+		parts = append(parts, configured)
+	}
+	return append(out, "PATH="+strings.Join(parts, string(os.PathListSeparator)))
+}
+
+type serviceOutputWriter struct {
+	dec decodeChunk
+}
+
+func (w *serviceOutputWriter) Write(p []byte) (int, error) {
+	text := w.dec.decode(p)
+	if text != "" {
+		_, _ = io.WriteString(os.Stdout, "[service] "+text)
+		serviceLog.push(text)
+	}
+	return len(p), nil
 }
 
 // startService spawns the configured command. It returns nil on success.
@@ -78,7 +131,22 @@ func mergedEnv(cfg map[string]any) []string {
 func startService(cfg map[string]any) error {
 	serviceMu.Lock()
 	defer serviceMu.Unlock()
+	return startServiceLocked(cfg)
+}
 
+func restartService(cfg map[string]any, gen int) error {
+	serviceMu.Lock()
+	defer serviceMu.Unlock()
+	if quitting.Load() {
+		return fmt.Errorf("service restart cancelled: application is quitting")
+	}
+	if serviceGen != gen {
+		return fmt.Errorf("service restart cancelled: stale generation")
+	}
+	return startServiceLocked(cfg)
+}
+
+func startServiceLocked(cfg map[string]any) error {
 	if serviceCmd != nil && serviceCmd.Process != nil {
 		stopServiceLocked()
 	}
@@ -87,9 +155,12 @@ func startService(cfg map[string]any) error {
 	if err != nil {
 		return err
 	}
+	if port := cfgInt(cfg, "service.port"); port > 0 && portListening(port) {
+		return fmt.Errorf("port %d is already in use by another process", port)
+	}
 
 	program, args := cmd[0], cmd[1:]
-	viaShell := runtime.GOOS != "windows"
+	viaShell := false
 	if runtime.GOOS == "windows" {
 		// Portable builds ship a bundled Node.js in <exe_dir>/node/ and a
 		// bundled Python in <exe_dir>/python/. Go's exec.Command resolves
@@ -124,29 +195,10 @@ func startService(cfg map[string]any) error {
 		c = exec.Command(program, args...)
 	}
 	c.Dir = cwd
-	c.Env = mergedEnv(cfg)
-	// Prepend the bundled node/ and python/ directories to PATH so the
-	// packaged binaries are found first (the recipient may not have them).
-	exeDir := filepath.Dir(mustExecutable())
-	extra := ""
-	for _, sub := range []string{"node", "python"} {
-		if dirExists(filepath.Join(exeDir, sub)) {
-			extra += filepath.Join(exeDir, sub) + string(os.PathListSeparator)
-		}
-	}
-	if extra != "" {
-		c.Env = append(c.Env, "PATH="+extra+os.Getenv("PATH"))
-	}
+	c.Env = prependBundledPath(mergedEnv(cfg), filepath.Dir(mustExecutable()))
+	c.Stdout = &serviceOutputWriter{}
+	c.Stderr = &serviceOutputWriter{}
 	applyHiddenFlags(c)
-
-	stdout, err := c.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := c.StderrPipe()
-	if err != nil {
-		return err
-	}
 
 	if err := c.Start(); err != nil {
 		return fmt.Errorf("failed to spawn service: %w", err)
@@ -156,8 +208,6 @@ func startService(cfg map[string]any) error {
 	serviceGen++
 	serviceExitCh = make(chan struct{})
 
-	go streamToLog(stdout, &serviceLog, "[service] ")
-	go streamToLog(stderr, &serviceLog, "[service] ")
 	go watchServiceExit(c, serviceGen, cfg)
 
 	return nil
@@ -193,7 +243,7 @@ func watchServiceExit(c *exec.Cmd, gen int, cfg map[string]any) {
 		// serviceGen) land inside the window and then this watcher started a
 		// SECOND service on top of the one they had just launched.
 		if autoRestartWait(gen) {
-			_ = startService(cfg)
+			_ = restartService(cfg, gen)
 		}
 	}
 }
@@ -229,6 +279,7 @@ func stopService() {
 }
 
 func stopServiceLocked() {
+	serviceGen++ // invalidate the exit watcher even during the restart delay
 	if serviceCmd == nil || serviceCmd.Process == nil {
 		serviceCmd = nil
 		return
@@ -236,7 +287,11 @@ func stopServiceLocked() {
 	fmt.Printf("[DeskWrap] %s\n", t("stoppingService"))
 	killProcessTree(serviceCmd.Process.Pid)
 	serviceCmd = nil
-	serviceGen++ // invalidate the exit watcher of the old process
+}
+
+func shutdownService() {
+	quitting.Store(true)
+	stopService()
 }
 
 // needsDepsInstall checks whether the project's dependencies appear to be
@@ -358,16 +413,30 @@ func needsRuntimeInstall(command []string) string {
 // Uses "localhost" instead of "127.0.0.1" so Vite 8+ (which defaults to
 // IPv6 localhost ::1) is detected correctly.
 func waitForService(port int, timeout time.Duration, exitCh <-chan struct{}) bool {
+	return waitForServiceWithDial(port, timeout, exitCh, net.DialTimeout)
+}
+
+func waitForServiceWithDial(port int, timeout time.Duration, exitCh <-chan struct{}, dial func(string, string, time.Duration) (net.Conn, error)) bool {
 	if port <= 0 {
 		return true // no port configured - assume ready after spawn
 	}
 	deadline := time.Now().Add(timeout)
 	addr := fmt.Sprintf("localhost:%d", port)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		select {
+		case <-exitCh:
+			return false
+		default:
+		}
+		conn, err := dial("tcp", addr, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			return true
+			select {
+			case <-exitCh:
+				return false
+			default:
+				return true
+			}
 		}
 		select {
 		case <-exitCh:

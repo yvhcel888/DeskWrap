@@ -5,7 +5,6 @@
 package main
 
 import (
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -31,7 +30,7 @@ func applyHiddenFlags(c *exec.Cmd) {
 }
 
 func shellCommand(program string, args []string) *exec.Cmd {
-	return exec.Command("/bin/sh", "-c", program+" "+strings.Join(args, " "))
+	return exec.Command(program, args...)
 }
 
 func killProcessTree(pid int) {
@@ -54,24 +53,6 @@ func (d *decodeChunk) decode(b []byte) string {
 		return string(b)
 	}
 	return string(b) // bytes.ToValidUTF8 is overkill for logs
-}
-
-func streamToLog(r io.Reader, dst *ringLog, prefix string) {
-	buf := make([]byte, 8192)
-	var dec decodeChunk
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			text := dec.decode(buf[:n])
-			if prefix != "" && text != "" {
-				_, _ = io.WriteString(os.Stdout, prefix+text)
-			}
-			dst.push(text)
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 func systemLocale() string {

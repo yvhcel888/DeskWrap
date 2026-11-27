@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -96,6 +97,84 @@ func getAiConfig() map[string]any {
 
 // --- proxy-aware HTTP -------------------------------------------------------
 
+const maxAppFetchResponseBytes = 4 << 20
+
+var sensitiveQueryValuePattern = regexp.MustCompile(`(?i)[?&]([^=&#\s"'<>]+)=([^&#\s"'<>]*)`)
+
+func sensitiveQueryKey(key string) bool {
+	key = strings.ToLower(strings.ReplaceAll(key, "-", "_"))
+	switch key {
+	case "access_token", "token", "private_token", "api_key", "apikey", "key",
+		"auth", "authorization", "password", "passwd", "secret", "client_secret",
+		"refresh_token", "signature", "sig", "credential", "credentials":
+		return true
+	default:
+		return false
+	}
+}
+
+// redactSensitiveQueryValues also handles malformed URLs, whose query may not
+// be parseable but can still be included verbatim in a net/http error.
+func redactSensitiveQueryValues(s string) string {
+	return sensitiveQueryValuePattern.ReplaceAllStringFunc(s, func(match string) string {
+		eq := strings.IndexByte(match, '=')
+		if eq < 0 || !sensitiveQueryKey(match[1:eq]) {
+			return match
+		}
+		return match[:eq+1] + "[REDACTED]"
+	})
+}
+
+func redactAppFetchError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(redactSensitiveQueryValues(err.Error()))
+}
+
+func sameHTTPOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			return "80"
+		case "https":
+			return "443"
+		default:
+			return ""
+		}
+	}
+	return port(a) == port(b)
+}
+
+// stripRedirectCredentials removes every non-allowlisted header so custom
+// platform credential headers cannot accidentally survive a cross-origin hop.
+func stripRedirectCredentials(req *http.Request) {
+	headers := make(http.Header)
+	for _, name := range []string{"Accept", "Content-Type", "User-Agent"} {
+		for _, value := range req.Header.Values(name) {
+			headers.Add(name, value)
+		}
+	}
+	req.Header = headers
+	req.Host = ""
+	u := *req.URL
+	u.User = nil
+	query := u.Query()
+	for key := range query {
+		if sensitiveQueryKey(key) {
+			delete(query, key)
+		}
+	}
+	u.RawQuery = query.Encode()
+	req.URL = &u
+}
+
 // newHTTPClient builds a client that honors config.proxy.enabled or the
 // standard HTTP(S)_PROXY / ALL_PROXY environment variables.
 func newHTTPClient() *http.Client {
@@ -114,7 +193,17 @@ func newHTTPClient() *http.Client {
 			}
 		}
 	}
-	return &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && !sameHTTPOrigin(via[len(via)-1].URL, req.URL) {
+			if req.Method != http.MethodGet && req.Method != http.MethodHead {
+				return fmt.Errorf("refusing cross-origin redirect for %s request", req.Method)
+			}
+			stripRedirectCredentials(req)
+		}
+		return nil
+	}
+	return client
 }
 
 // appFetch performs a request through the proxy-aware client with a timeout.
@@ -128,19 +217,22 @@ func appFetch(method, urlStr string, headers map[string]string, body []byte, tim
 	}
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, rdr)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, redactAppFetchError(err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, redactAppFetchError(err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAppFetchResponseBytes+1))
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, redactAppFetchError(err)
+	}
+	if len(data) > maxAppFetchResponseBytes {
+		return nil, resp.StatusCode, fmt.Errorf("response body exceeds 4 MiB limit")
 	}
 	return data, resp.StatusCode, nil
 }
@@ -202,17 +294,24 @@ func aiSettingsFromOpts(opts map[string]any) map[string]any {
 	if opts == nil {
 		return cfg
 	}
-	provider := fmt.Sprint(orDefault(opts["provider"], fmt.Sprint(cfg["provider"])))
+	configuredProvider := fmt.Sprint(cfg["provider"])
+	provider := configuredProvider
+	if v := opts["provider"]; v != nil {
+		if selected := strings.TrimSpace(fmt.Sprint(v)); selected != "" {
+			provider = selected
+		}
+	}
+	sameProvider := provider == configuredProvider
 	prov := providerOr(provider)
 	base := fmt.Sprint(orDefault(opts["baseUrl"], ""))
-	if base == "" && fmt.Sprint(cfg["provider"]) == provider {
+	if base == "" && sameProvider {
 		base = fmt.Sprint(cfg["base"])
 	}
 	if base == "" {
 		base = prov.base
 	}
 	model := fmt.Sprint(orDefault(opts["model"], ""))
-	if model == "" && fmt.Sprint(cfg["provider"]) == provider {
+	if model == "" && sameProvider {
 		model = fmt.Sprint(cfg["model"])
 	}
 	if model == "" {
@@ -220,7 +319,11 @@ func aiSettingsFromOpts(opts map[string]any) map[string]any {
 	}
 	key := fmt.Sprint(orDefault(opts["apiKey"], ""))
 	if key == "" {
-		key = fmt.Sprint(cfg["apiKey"])
+		if sameProvider {
+			key = fmt.Sprint(cfg["apiKey"])
+		} else {
+			key = os.Getenv(strings.ToUpper(provider) + "_API_KEY")
+		}
 	}
 	enabled := cfgBool(cfg, "enabled")
 	if v, ok := opts["enabled"].(bool); ok {
@@ -291,20 +394,12 @@ func jsonString(v any) string {
 
 // aiTest checks the provider connection with the given settings.
 func aiTest(opts map[string]any) map[string]any {
-	provider := fmt.Sprint(orDefault(opts["provider"], "glm"))
+	ai := aiSettingsFromOpts(opts)
+	provider := fmt.Sprint(ai["provider"])
 	prov := providerOr(provider)
-	base := fmt.Sprint(orDefault(opts["baseUrl"], ""))
-	if base == "" {
-		base = prov.base
-	}
-	model := fmt.Sprint(orDefault(opts["model"], ""))
-	if model == "" {
-		model = prov.model
-	}
-	key := fmt.Sprint(orDefault(opts["apiKey"], ""))
-	if key == "" {
-		key = fmt.Sprint(getAiConfig()["apiKey"])
-	}
+	base := fmt.Sprint(ai["base"])
+	model := fmt.Sprint(ai["model"])
+	key := fmt.Sprint(ai["apiKey"])
 	if !prov.noKey && key == "" {
 		return map[string]any{"ok": false, "error": "未填写 API Key"}
 	}
@@ -322,16 +417,9 @@ func aiTest(opts map[string]any) map[string]any {
 
 // aiModels fetches the provider's /models list (best effort).
 func aiModels(opts map[string]any) map[string]any {
-	provider := fmt.Sprint(orDefault(opts["provider"], "glm"))
-	prov := providerOr(provider)
-	base := fmt.Sprint(orDefault(opts["baseUrl"], ""))
-	if base == "" {
-		base = prov.base
-	}
-	key := fmt.Sprint(orDefault(opts["apiKey"], ""))
-	if key == "" {
-		key = fmt.Sprint(getAiConfig()["apiKey"])
-	}
+	ai := aiSettingsFromOpts(opts)
+	base := fmt.Sprint(ai["base"])
+	key := fmt.Sprint(ai["apiKey"])
 	if base == "" {
 		return map[string]any{"ok": false, "error": "无 API 地址"}
 	}

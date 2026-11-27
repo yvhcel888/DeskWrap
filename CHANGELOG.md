@@ -2,6 +2,27 @@
 
 All notable changes to DeskWrap are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/).
 
+## [2.0.2] - 2026-11-27
+
+安全与稳定性集中修复：特权 GUI、服务生命周期、配置往返、网络凭据与跨平台打包。
+
+### Fixed / 修复
+
+- **远程平台信息 XSS（安全）**：仓库名称、描述与错误信息改为 DOM/textContent 渲染，本地 GUI 与错误页增加 CSP；切换 AI 提供商时清空旧密钥，避免凭据串发
+- **打包密钥泄漏与递归复制（安全）**：符号链接/junction 展开同样执行密钥排除与输出目录跳过；拒绝输出目录包含源码；清理旧 `app/` 残留；顶层旧 zip 不再打入新包，项目内部合法 zip 资源保留
+- **服务退出与自动重启竞态**：停止服务始终使旧世代失效，重启前原子校验世代与退出状态；避免关闭窗口后遗留新进程
+- **端口与日志可靠性**：启动前拒绝占用端口；就绪探测检查子进程退出；等待 stdout/stderr 读取完成后才发布退出，避免丢失末尾日志
+- **Windows 命令参数损坏与注入**：`.cmd` 回退参数按 argv 转义，保留空格、引号、百分号、元字符与尾随反斜杠；换行参数明确拒绝；ANSI 编码初始化改为 `sync.Once`
+- **GUI 配置丢失**：加载/保存保留 `service.env`、`readyTimeout`、窗口尺寸与未展示字段；保存与语言切换正确报告失败；重复运行使用新配置重建服务窗口；托盘退出统一关闭 GUI 与服务
+- **服务页面特权调用（安全）**：重试与依赖安装绑定增加随机令牌校验，令牌只注入本地错误页，远程服务页面无法直接调用壳层特权方法
+- **CLI 与检测**：`--config` 正确传递给 run/build/detect；相对 `service.cwd` 按配置文件目录解析；普通 `app.py` 的 Streamlit 项目使用 `streamlit run app.py`
+- **网络安全**：平台 Token 改用认证头并脱敏错误；跨域重定向剥离凭据且拒绝 POST 重放；HTTP 响应超过 4 MiB 明确报错；WebView2 安装包校验状态与 PE 头
+- **跨平台构建**：Windows 控制台 API 移入平台文件，Linux/macOS 交叉编译恢复
+
+### Added / 新增
+
+- 回归测试覆盖打包链接安全、输出目录保护、进程世代竞态、日志尾包、命令行转义、GUI 配置往返、XSS 渲染、凭据隔离、重定向与响应大小限制
+
 ## [2.0.1] - 2026-08-29
 
 2.0.0 发布后的修复与增强：双击即用补全（Node + Python）、pnpm monorepo 支持、多项打包可靠性修复。

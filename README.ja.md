@@ -30,7 +30,7 @@ AI が生成したプロジェクトに欠けている「最後のワンマイ�
 
 ### GUI 版（ダブルクリックだけで、ターミナル不要）
 
-[Releases](https://github.com/yvhcel888/DeskWrap/releases) から `DeskWrap-GUI-2.0.0-win-x64.zip` をダウンロード・解凍し、**DeskWrap-GUI.exe** をダブルクリック：
+[Releases](https://github.com/yvhcel888/DeskWrap/releases) から `DeskWrap-GUI-2.0.2-win-x64.zip` をダウンロード・解凍し、**DeskWrap-GUI.exe** をダブルクリック：
 
 1. **プロジェクト**パネル → フォルダを選択（または git URL を貼り付け）
 2. 起動コマンドとポートが自動入力 → **▶ 実行**でデスクトップウィンドウが開く

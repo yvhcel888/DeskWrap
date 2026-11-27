@@ -99,6 +99,35 @@ func pickPathAny(m map[string]any, path string) any {
 	return pickPath(m, path)
 }
 
+// cloneDestination derives a single repository directory name and verifies
+// that the resulting path remains directly under projectsRoot.
+func cloneDestination(projectsRoot, input string) (string, error) {
+	name := strings.TrimSuffix(input, ".git")
+	if i := strings.LastIndexAny(name, "/:"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		name = "project"
+	}
+	decoded, err := url.PathUnescape(name)
+	if err != nil || decoded == "." || decoded == ".." || decoded == "" ||
+		strings.ContainsAny(decoded, `/\:`) || strings.ContainsRune(decoded, '\x00') ||
+		filepath.IsAbs(decoded) || filepath.VolumeName(decoded) != "" || filepath.Base(decoded) != decoded {
+		return "", fmt.Errorf("invalid repository name")
+	}
+	root, err := filepath.Abs(projectsRoot)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(root, name)
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("clone destination escapes projects directory")
+	}
+	return target, nil
+}
+
 // resolveProjectInput resolves a user address (local path or git URL).
 func resolveProjectInput(address string) map[string]any {
 	input := strings.TrimSpace(address)
@@ -128,18 +157,14 @@ func resolveProjectInput(address string) map[string]any {
 			home, _ := os.UserHomeDir()
 			projectsRoot = filepath.Join(home, "DeskWrapProjects")
 		}
+		target, err := cloneDestination(projectsRoot, input)
+		if err != nil {
+			return map[string]any{"ok": false, "error": err.Error()}
+		}
 		if err := os.MkdirAll(projectsRoot, 0o755); err != nil {
 			return map[string]any{"ok": false, "error": err.Error()}
 		}
 
-		name := strings.TrimSuffix(input, ".git")
-		if i := strings.LastIndexAny(name, "/:"); i >= 0 {
-			name = name[i+1:]
-		}
-		if name == "" {
-			name = "project"
-		}
-		target := filepath.Join(projectsRoot, name)
 		if !dirExists(target) {
 			args := []string{"clone", "--depth", "1"}
 			if cfgBool(proxy, "enabled") && cfgStr(proxy, "url") != "" {
@@ -193,6 +218,24 @@ func lastN(lines []string, n int) []string {
 	return lines[len(lines)-n:]
 }
 
+// platformAuthHeader selects the authentication mechanism supported by each
+// built-in platform. Credentials stay in headers rather than proxy-visible URLs.
+func platformAuthHeader(platformID string, plat map[string]any) (string, string) {
+	header := "Authorization"
+	prefix := "Bearer"
+	switch strings.ToLower(platformID) {
+	case "gitlab":
+		header = "PRIVATE-TOKEN"
+		prefix = ""
+	case "codeberg":
+		prefix = "token"
+	}
+	if configured := fmt.Sprint(plat["authHeader"]); configured != "" && configured != "<nil>" {
+		header = configured
+	}
+	return header, prefix
+}
+
 // platformSearch queries a platform's search API and maps the results.
 func platformSearch(platformID, query string) map[string]any {
 	var plat map[string]any
@@ -212,15 +255,11 @@ func platformSearch(platformID, query string) map[string]any {
 		"Accept":     "application/json",
 	}
 	if token != "" {
-		if platformID == "modelscope" || fmt.Sprint(plat["authHeader"]) != "" && fmt.Sprint(plat["authHeader"]) != "<nil>" {
-			headers["Authorization"] = "Bearer " + token
-		} else {
-			sep := "&"
-			if !strings.Contains(searchURL, "?") {
-				sep = "?"
-			}
-			searchURL += sep + "access_token=" + url.QueryEscape(token)
+		header, prefix := platformAuthHeader(platformID, plat)
+		if prefix != "" {
+			token = prefix + " " + token
 		}
+		headers[header] = token
 	}
 
 	data, status, err := appFetch("GET", searchURL, headers, nil, 30*time.Second)

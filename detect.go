@@ -205,10 +205,16 @@ func detect(dir string) map[string]any {
 				port = 8501
 			}
 			result["type"] = "python"
-			result["command"] = "python"
-			result["args"] = []string{"app.py"}
+			if port == 8501 {
+				result["command"] = "streamlit"
+				result["args"] = []string{"run", "app.py"}
+				hints("streamlit app detected (app.py)")
+			} else {
+				result["command"] = "python"
+				result["args"] = []string{"app.py"}
+				hints("app.py found, guessed port " + itoa(port))
+			}
 			result["port"] = port
-			hints("app.py found, guessed port " + itoa(port))
 		}
 	}
 

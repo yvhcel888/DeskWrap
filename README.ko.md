@@ -30,7 +30,7 @@ AI가 생성한 프로젝트에 빠져 있던 "마지막 1마일": 코드는 있
 
 ### GUI 버전(더블클릭만으로, 터미널 불필요)
 
-[Releases](https://github.com/yvhcel888/DeskWrap/releases)에서 `DeskWrap-GUI-2.0.0-win-x64.zip`을 받아 압축을 풀고 **DeskWrap-GUI.exe**를 더블클릭하세요:
+[Releases](https://github.com/yvhcel888/DeskWrap/releases)에서 `DeskWrap-GUI-2.0.2-win-x64.zip`을 받아 압축을 풀고 **DeskWrap-GUI.exe**를 더블클릭하세요:
 
 1. **프로젝트** 패널 → 폴더 선택(또는 git URL 붙여넣기)
 2. 시작 명령과 포트가 자동 입력 → **▶ 실행**으로 데스크톱 창 열기

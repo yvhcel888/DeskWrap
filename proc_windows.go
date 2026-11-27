@@ -11,13 +11,13 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode/utf8"
 
@@ -39,9 +39,14 @@ const (
 // shimExpand replaces %~dp0 and %VAR% references with resolved values.
 func shimExpand(s, shimDir string) string {
 	re := regexp.MustCompile(`(?i)%~dp0`)
-	s = re.ReplaceAllString(s, shimDir)
+	s = re.ReplaceAllStringFunc(s, func(string) string { return shimDir })
 	s = os.Expand(s, func(k string) string { return os.Getenv(k) })
 	return strings.TrimSpace(s)
+}
+
+func replaceShimDir(s, shimDir string) string {
+	re := regexp.MustCompile(`(?i)%~dp0`)
+	return re.ReplaceAllStringFunc(s, func(string) string { return shimDir })
 }
 
 // findCmdInPath locates a .cmd/.bat shim on PATH.
@@ -202,22 +207,68 @@ func applyHiddenFlags(c *exec.Cmd) {
 // preserves quotes when there are exactly two " and no special chars
 // between them, so the path stays intact.
 func shellCommand(program string, args []string) *exec.Cmd {
-	if strings.ContainsAny(program, " \t") {
-		argPart := ""
-		if len(args) > 0 {
-			argPart = " " + strings.Join(args, " ")
-		}
-		c := exec.Command("cmd.exe")
-		c.SysProcAttr = &syscall.SysProcAttr{
-			CmdLine: `cmd.exe /d /c "` + program + `"` + argPart,
-		}
+	c := exec.Command("cmd.exe")
+	if strings.ContainsAny(program, "\r\n") {
+		c.Err = fmt.Errorf("command path contains a newline")
 		return c
 	}
-	line := program
-	if len(args) > 0 {
-		line += " " + strings.Join(args, " ")
+	for _, arg := range args {
+		if strings.ContainsAny(arg, "\r\n") {
+			c.Err = fmt.Errorf("command argument contains a newline")
+			return c
+		}
 	}
-	return exec.Command("cmd.exe", "/d", "/s", "/c", line)
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, escapeCmdCommand(program))
+	for _, arg := range args {
+		parts = append(parts, quoteCmdArg(arg))
+	}
+	line := strings.Join(parts, " ")
+	c.SysProcAttr = &syscall.SysProcAttr{
+		CmdLine: `cmd.exe /d /v:off /s /c "` + line + `"`,
+	}
+	return c
+}
+
+func escapeCmdCommand(arg string) string {
+	var b strings.Builder
+	for _, r := range arg {
+		if strings.ContainsRune(`()[]%!^"`+"`"+`<>&|;, *?`, r) {
+			b.WriteByte('^')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func quoteCmdArg(arg string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	backslashes := 0
+	for _, r := range arg {
+		if r == '\\' {
+			backslashes++
+			continue
+		}
+		if r == '"' {
+			b.WriteString(strings.Repeat(`\`, backslashes*2+1))
+		} else {
+			b.WriteString(strings.Repeat(`\`, backslashes))
+		}
+		backslashes = 0
+		b.WriteRune(r)
+	}
+	b.WriteString(strings.Repeat(`\`, backslashes*2))
+	b.WriteByte('"')
+	quoted := b.String()
+	b.Reset()
+	for _, r := range quoted {
+		if strings.ContainsRune(`()[]%!^"`+"`"+`<>&|;, *?`, r) {
+			b.WriteByte('^')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // killProcessTree terminates the process and all its descendants.
@@ -233,7 +284,7 @@ func killProcessTree(pid int) {
 // --- output decoding: strict UTF-8 first, then the system ANSI codepage ----
 
 var ansiEnc = struct {
-	done bool
+	once sync.Once
 	enc  encoding.Encoding
 }{}
 
@@ -242,70 +293,68 @@ var ansiEnc = struct {
 // read from the registry - never hard-coded to GBK, so logs stay correct
 // on any locale.
 func systemANSIEncoding() encoding.Encoding {
-	if ansiEnc.done {
-		return ansiEnc.enc
-	}
-	ansiEnc.done = true
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
-		`SYSTEM\CurrentControlSet\Control\Nls\CodePage`, registry.QUERY_VALUE)
-	if err != nil {
-		return nil
-	}
-	defer k.Close()
-	// The CodePage values are REG_SZ strings ("936"), not DWORDs — reading
-	// them with GetIntegerValue always fails with "unexpected key value
-	// type" and silently disables the ANSI fallback (mojibake).
-	acpStr, _, err := k.GetStringValue("ACP")
-	if err != nil {
-		return nil
-	}
-	acp, err := strconv.Atoi(strings.TrimSpace(acpStr))
-	if err != nil {
-		return nil
-	}
-	var enc encoding.Encoding
-	switch acp {
-	case 936:
-		enc = simplifiedchinese.GBK
-	case 54936:
-		enc = simplifiedchinese.GB18030
-	case 950:
-		enc = traditionalchinese.Big5
-	case 932:
-		enc = japanese.ShiftJIS
-	case 949:
-		enc = korean.EUCKR
-	case 1250:
-		enc = charmap.Windows1250
-	case 1251:
-		enc = charmap.Windows1251
-	case 1252:
-		enc = charmap.Windows1252
-	case 1253:
-		enc = charmap.Windows1253
-	case 1254:
-		enc = charmap.Windows1254
-	case 1255:
-		enc = charmap.Windows1255
-	case 1256:
-		enc = charmap.Windows1256
-	case 1257:
-		enc = charmap.Windows1257
-	case 1258:
-		enc = charmap.Windows1258
-	case 437:
-		enc = charmap.CodePage437
-	case 850:
-		enc = charmap.CodePage850
-	case 852:
-		enc = charmap.CodePage852
-	case 866:
-		enc = charmap.CodePage866
-	default:
-		return nil
-	}
-	ansiEnc.enc = enc
-	return enc
+	ansiEnc.once.Do(func() {
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE,
+			`SYSTEM\CurrentControlSet\Control\Nls\CodePage`, registry.QUERY_VALUE)
+		if err != nil {
+			return
+		}
+		defer k.Close()
+		// The CodePage values are REG_SZ strings ("936"), not DWORDs — reading
+		// them with GetIntegerValue always fails with "unexpected key value
+		// type" and silently disables the ANSI fallback (mojibake).
+		acpStr, _, err := k.GetStringValue("ACP")
+		if err != nil {
+			return
+		}
+		acp, err := strconv.Atoi(strings.TrimSpace(acpStr))
+		if err != nil {
+			return
+		}
+		var enc encoding.Encoding
+		switch acp {
+		case 936:
+			enc = simplifiedchinese.GBK
+		case 54936:
+			enc = simplifiedchinese.GB18030
+		case 950:
+			enc = traditionalchinese.Big5
+		case 932:
+			enc = japanese.ShiftJIS
+		case 949:
+			enc = korean.EUCKR
+		case 1250:
+			enc = charmap.Windows1250
+		case 1251:
+			enc = charmap.Windows1251
+		case 1252:
+			enc = charmap.Windows1252
+		case 1253:
+			enc = charmap.Windows1253
+		case 1254:
+			enc = charmap.Windows1254
+		case 1255:
+			enc = charmap.Windows1255
+		case 1256:
+			enc = charmap.Windows1256
+		case 1257:
+			enc = charmap.Windows1257
+		case 1258:
+			enc = charmap.Windows1258
+		case 437:
+			enc = charmap.CodePage437
+		case 850:
+			enc = charmap.CodePage850
+		case 852:
+			enc = charmap.CodePage852
+		case 866:
+			enc = charmap.CodePage866
+		default:
+			return
+		}
+		ansiEnc.enc = enc
+	})
+	return ansiEnc.enc
 }
 
 // utf8ExpectedLen returns the total length of the UTF-8 sequence a lead byte
@@ -385,29 +434,6 @@ func incompleteSeqLen(b []byte) int {
 		return 0 // the sequence does fit inside this chunk
 	}
 	return n
-}
-
-// streamToLog pipes child output into a ring log (decoded) and echoes it to
-// our stdout, mirroring the original "service log" behaviour.
-func streamToLog(r io.Reader, dst *ringLog, prefix string) {
-	buf := make([]byte, 8192)
-	var dec decodeChunk
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			text := dec.decode(buf[:n])
-			if prefix != "" && text != "" {
-				_, _ = io.WriteString(os.Stdout, prefix+text)
-				if !strings.HasSuffix(text, "\n") {
-					_, _ = io.WriteString(os.Stdout, "\n")
-				}
-			}
-			dst.push(text)
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 var (
